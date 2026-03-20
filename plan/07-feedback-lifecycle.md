@@ -88,16 +88,20 @@ ORDER BY active_count DESC;
 状态存储在 `contexts.status` 列中：
 
 ```
-          创建 ──→  active  ←── 被访问/更新时重置
-                      │ 标记过时(变更传播) 或 超过 N 天未访问
-                      ▼
-                    stale   ←── status = 'stale'
-                      │ 超过 M 天仍为 stale 且未被访问
-                      ▼
-                   archived ←── 从向量索引中移除，PG 行保留
-                      │ 超过 K 天（可选）
-                      ▼
-                   deleted  ←── PG 行标记 deleted（或移至冷存储）
+                              审核通过
+          提升请求 ──→ pending_review ──→ active  ←── 被访问/更新时重置
+          创建 ──────────────────────→ active
+                                         │ 标记过时(变更传播) 或 超过 N 天未访问
+                                         ▼
+                                       stale   ←── status = 'stale'
+                                         │ 超过 M 天仍为 stale 且未被访问
+                                         ▼
+                                      archived ←── 从向量索引中移除，PG 行保留
+                                         │ 超过 K 天（可选）
+                                         ▼
+                                      deleted  ←── PG 行标记 deleted（或移至冷存储）
+
+注：pending_review 仅用于记忆提升审核流程（MVP 阶段跳过，直接进入 active）。
 ```
 
 状态转换通过 PG 操作实现：

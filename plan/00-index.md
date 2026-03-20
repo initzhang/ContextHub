@@ -27,25 +27,32 @@
 | [08-architecture.md](08-architecture.md) | 系统架构 | PG 中心架构图、ContextStore URI 路由层、数据流 |
 | [09-implementation-plan.md](09-implementation-plan.md) | 实施计划 | MVP 场景、SDK、Benchmark、Phase 1-3、PG 中心技术选型 |
 | [10-code-architecture.md](10-code-architecture.md) | 代码架构 | 项目目录结构、依赖注入、API 端点、VectorStore 抽象、L0/L1 生成 |
+| [11-long-document-retrieval.md](11-long-document-retrieval.md) | 长文档检索策略 | 可插拔扩展、文档树结构、全文检索 + 窗口提取、量化验证方案 |
+| [12-evolution-notes.md](12-evolution-notes.md) | 架构演进备忘 | MVP 后的升级路径：大文本→对象存储、事件传播→消息队列，含预留接口设计 |
 
 ## 依赖关系
 
 ```
 01-storage-paradigm ──→ 02-information-model ──→ 03-datalake-management
-        │                                              │
-        └──→ 04-multi-agent-collaboration              │
-                    │                                   │
-                    ├──→ 05-access-control-audit        │
-                    │                                   │
-                    └──→ 06-change-propagation ←────────┘
-                                │
+        │                       │                        │
+        │                       └──→ 11-long-document-retrieval
+        │                                                │
+        └──→ 04-multi-agent-collaboration                │
+                    │                                    │
+                    ├──→ 05-access-control-audit          │
+                    │                                    │
+                    └──→ 06-change-propagation ←─────────┘
+                                │        ↑
+                                │        └── 11-long-document-retrieval
                                 └──→ 07-feedback-lifecycle
                                             │
                     08-architecture ←────────┘
                             │
                             └──→ 09-implementation-plan
                                         │
-                                        └──→ 10-code-architecture
+                                        ├──→ 10-code-architecture
+                                        │
+                                        └──→ 12-evolution-notes（架构演进备忘，依赖 01 + 06）
 ```
 
 ## 建议阅读顺序
@@ -53,3 +60,4 @@
 实现时按编号顺序阅读即可。如果只关注某条线：
 - 线 A（数据湖）：01 → 02 → 03 → 08 → 09
 - 线 B（多 Agent）：01 → 02 → 04 → 05 → 06 → 07 → 08 → 09
+- 线 C（长文档检索）：01 → 02 → 11 → 06 → 09

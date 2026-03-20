@@ -78,12 +78,12 @@ CREATE TABLE contexts (
     l2_content      TEXT,                    -- 完整内容（非 datalake 类型使用）
 
     -- 元数据
-    status          TEXT DEFAULT 'active',   -- active | stale | archived | deleted
+    status          TEXT DEFAULT 'active',   -- active | stale | archived | deleted | pending_review
     version         INT DEFAULT 1,
     tags            TEXT[],
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     updated_at      TIMESTAMPTZ DEFAULT NOW(),
-    last_accessed_at TIMESTAMPTZ,
+    last_accessed_at TIMESTAMPTZ DEFAULT NOW(),  -- 初始值 = 创建时间，避免 NULL 导致生命周期 SQL 失效
 
     -- 热度与质量
     active_count    INT DEFAULT 0,
@@ -96,27 +96,41 @@ ALTER TABLE contexts ENABLE ROW LEVEL SECURITY;
 CREATE POLICY tenant_isolation ON contexts
     USING (account_id = current_setting('app.account_id'));
 
+-- 重要：每个请求必须在 PG 连接上设置 app.account_id，否则 RLS 无法生效。
+-- 实现位置：db/repository.py 的 acquire_connection() 方法中：
+--   await conn.execute("SET LOCAL app.account_id = $1", request_context.account_id)
+-- SET LOCAL 作用域限于当前事务，事务结束后自动清除，不会泄漏到连接池的其他使用者。
+
 -- 常用索引
 CREATE INDEX idx_contexts_scope ON contexts (scope, context_type);
 CREATE INDEX idx_contexts_owner ON contexts (account_id, owner_space);
 CREATE INDEX idx_contexts_status ON contexts (status) WHERE status != 'deleted';
 ```
 
-### dependencies 表（替代 .deps.json）
+### dependencies 表（统一依赖 + 订阅）
+
+合并了原 `skill_subscriptions` 表。Skill 订阅本质上也是一种依赖关系（dep_type='skill_subscription'），统一管理避免双轨不一致。
 
 ```sql
 CREATE TABLE dependencies (
     id              SERIAL PRIMARY KEY,
-    source_uri      TEXT NOT NULL REFERENCES contexts(uri),  -- 依赖方
+    source_uri      TEXT NOT NULL REFERENCES contexts(uri),  -- 依赖方（Agent context 或 Agent 自身 URI）
     target_uri      TEXT NOT NULL,                           -- 被依赖方
-    dep_type        TEXT NOT NULL,           -- 'skill_version' | 'table_schema' | 'derived_from'
-    pinned_version  TEXT,                    -- 依赖的特定版本（如 Skill v2）
+    dep_type        TEXT NOT NULL,           -- 'skill_version' | 'table_schema' | 'derived_from' | 'skill_subscription'
+    pinned_version  TEXT,                    -- 依赖的特定版本（NULL = 跟随 latest）
     created_at      TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE (source_uri, target_uri, dep_type)
 );
 
 CREATE INDEX idx_deps_target ON dependencies (target_uri);  -- 变更传播时按 target 查依赖方
+CREATE INDEX idx_deps_source ON dependencies (source_uri);  -- 查某个 Agent 的所有依赖
 ```
+
+dep_type 语义：
+- `skill_version`：Agent 的某个 case/pattern 依赖 Skill 的特定版本（写入 case 时自动注册）
+- `skill_subscription`：Agent 主动订阅某个 Skill（通过 API 显式注册），pinned_version=NULL 表示跟随 latest
+- `table_schema`：依赖某张表的 schema
+- `derived_from`：从某个共享 memory 派生
 
 ### change_events 表（替代 Event Log）
 
@@ -218,9 +232,9 @@ L0 摘要被向量化后存入向量数据库，用于语义检索。PG 是 sour
 | 关系类型 | PG 表 | 查询方式 |
 |----------|-------|----------|
 | 上下文依赖（Skill 版本、表 schema） | `dependencies` | `SELECT * FROM dependencies WHERE target_uri = $1` |
+| Skill 订阅 | `dependencies`（dep_type='skill_subscription'） | `SELECT * FROM dependencies WHERE source_uri = $1 AND dep_type = 'skill_subscription'` |
 | 表间 JOIN 关系 | `table_relationships`（见 03） | SQL JOIN |
 | 数据血缘 | `lineage`（见 03） | 递归 CTE 遍历 |
-| Skill 订阅 | `skill_subscriptions`（见 04） | 标量查询 |
 
 **优势：**
 - 变更传播时查依赖方：一条 SQL，不需要遍历文件系统
@@ -232,30 +246,47 @@ L0 摘要被向量化后存入向量数据库，用于语义检索。PG 是 sour
 ### 可见性（逻辑继承，PG 查询实现）
 
 ```
-Agent 所属团队路径: team/engineering/backend
+Agent 所属团队路径: team/engineering/backend, team/data/analytics（支持多团队归属）
 
 该 Agent 可见的上下文（从私有到全局）:
   1. ctx://agent/{self}/              ← 私有空间
   2. ctx://user/{user_id}/            ← 所服务用户的记忆
-  3. ctx://team/engineering/backend/  ← 所属团队
-  4. ctx://team/engineering/          ← 上级团队（自动继承）
-  5. ctx://team/                      ← 根团队 = 全组织（自动继承）
-  6. ctx://datalake/                  ← 数据湖（受 ACL 控制）
-  7. ctx://resources/                 ← 文档资源（受 ACL 控制）
+  3. ctx://team/engineering/backend/  ← 所属团队 A
+  4. ctx://team/engineering/          ← 团队 A 的上级（自动继承）
+  5. ctx://team/data/analytics/       ← 所属团队 B
+  6. ctx://team/data/                 ← 团队 B 的上级（自动继承）
+  7. ctx://team/                      ← 根团队 = 全组织（自动继承）
+  8. ctx://datalake/                  ← 数据湖（受 ACL 控制）
+  9. ctx://resources/                 ← 文档资源（受 ACL 控制）
 ```
 
-实现方式：PG 查询时通过 `owner_space` 前缀匹配实现层级继承：
+实现方式：从 `team_memberships` 动态展开所有团队路径及其祖先，通过 `owner_space = ANY($visible_spaces)` 匹配：
+
+```python
+async def get_visible_owner_spaces(self, agent_id: str) -> list[str]:
+    """展开 Agent 的所有可见 owner_space（含祖先链）"""
+    team_paths = await self.pg.fetch(
+        "SELECT team_path FROM team_memberships WHERE agent_id = $1", agent_id)
+    spaces = set()
+    spaces.add('')  # 根团队（owner_space = '' 或 NULL）
+    for row in team_paths:
+        path = row['team_path']
+        # 展开祖先链：'engineering/backend' → ['engineering/backend', 'engineering', '']
+        parts = path.split('/')
+        for i in range(len(parts)):
+            spaces.add('/'.join(parts[:i+1]))
+    return list(spaces)
+```
 
 ```sql
--- Agent 属于 engineering/backend，可见自己团队及所有上级团队的内容
+-- 可见性查询（支持多团队归属）
+-- $visible_spaces 由 get_visible_owner_spaces() 生成
 SELECT * FROM contexts
 WHERE account_id = $1
   AND (
-    owner_space = 'engineering/backend'           -- 本团队
-    OR owner_space = 'engineering'                 -- 上级
-    OR owner_space = '' OR owner_space IS NULL     -- 根团队
-    OR scope IN ('datalake', 'resources')          -- 公共资源（受 ACL 进一步控制）
-    OR (scope = 'agent' AND owner_space = $agent_id)  -- 私有空间
+    owner_space = ANY($visible_spaces)              -- 所有可见团队（含祖先链）
+    OR scope IN ('datalake', 'resources')            -- 公共资源（受 ACL 进一步控制）
+    OR (scope = 'agent' AND owner_space = $agent_id) -- 私有空间
   );
 ```
 
@@ -308,13 +339,20 @@ class ContextStore:
         return await self.acl.apply_field_masks(content, uri, ctx)
 
     async def write(self, uri: str, level: ContextLevel, content: str, ctx: RequestContext):
+        # 列名白名单映射（防止 f-string 拼接 SQL 注入）
+        LEVEL_COLUMNS = {0: 'l0_content', 1: 'l1_content', 2: 'l2_content'}
+        column = LEVEL_COLUMNS[level.value]
+
         async with self.db.transaction():
             # 1. 权限检查
             await self.acl.check_access(uri, ctx, action='write')
-            # 2. 写入 PG（内容 + 元数据在同一个事务中）
-            await self.db.execute(
-                f"UPDATE contexts SET l{level.value}_content = $1, version = version + 1, "
-                f"updated_at = NOW() WHERE uri = $2", content, uri)
+            # 2. 写入 PG（乐观锁：version 条件防止并发覆盖）
+            result = await self.db.execute(f"""
+                UPDATE contexts SET {column} = $1, version = version + 1,
+                    updated_at = NOW() WHERE uri = $2 AND version = $3
+            """, content, uri, ctx.expected_version)
+            if result == 'UPDATE 0':
+                raise ConcurrentModificationError(f"URI {uri} has been modified by another writer")
             # 3. 发出变更事件（同一事务内）
             await self.db.execute(
                 "INSERT INTO change_events (source_uri, change_type, actor) VALUES ($1, 'modified', $2)",

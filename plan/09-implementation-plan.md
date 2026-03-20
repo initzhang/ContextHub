@@ -222,7 +222,7 @@ await ctx.memory.promote(
 ### Phase 1: 项目骨架 & 核心抽象（1-2 周）
 1. 初始化项目（Python, FastAPI, pyproject.toml）
 2. PG 数据库初始化：
-   - 创建所有核心表（contexts, dependencies, change_events, table_metadata, lineage, table_relationships, query_templates, skill_versions, skill_subscriptions, access_policies, audit_log, team_memberships, lifecycle_policies, context_feedback）
+   - 创建所有核心表（contexts, dependencies, change_events, table_metadata, lineage, table_relationships, query_templates, skill_versions, access_policies, audit_log, team_memberships, lifecycle_policies, context_feedback）
    - 配置 RLS 策略
    - 创建索引
 3. 实现 ContextStore（URI 路由层）：ctx:// URI → PG 读写 + ACL 检查

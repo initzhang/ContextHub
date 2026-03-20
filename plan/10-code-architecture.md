@@ -89,9 +89,19 @@ contexthub/
 │       │   ├── memory.py              # MemoryStrategy（模板 + 可选 LLM）
 │       │   └── resource.py            # ResourceStrategy（LLM）
 │       │
+│       ├── retrieval/                # 检索策略层（可插拔）
+│       │   ├── router.py             # RetrievalRouter：按 context_type 分发检索策略
+│       │   ├── vector_strategy.py    # 默认策略：向量检索 L0 → PG L1 rerank
+│       │   ├── rerank.py             # RerankStrategy ABC + KeywordRerankStrategy（BM25）
+│       │   ├── tree_strategy.py      # 长文档树导航检索（Phase 2 可选）
+│       │   └── keyword_strategy.py   # 长文档 ripgrep 关键词检索（Phase 2 可选）
+│       │
+│       ├── ingestion/                # 内容入库管线
+│       │   └── long_document.py      # LongDocumentIngester（Phase 2 可选）
+│       │
 │       └── api/                       # FastAPI 路由
 │           ├── deps.py                # Depends 工厂函数
-│           ├── middleware.py           # 认证中间件
+│           ├── middleware.py           # 认证中间件（含 RLS SET LOCAL）
 │           └── routers/
 │               ├── contexts.py        # /api/v1/contexts
 │               ├── search.py          # /api/v1/search
@@ -100,6 +110,25 @@ contexthub/
 │               ├── datalake.py        # /api/v1/datalake
 │               ├── tools.py           # /api/v1/tools（LLM tool use: ls/read/grep/stat）
 │               └── admin.py           # /api/v1/admin
+│
+├── sdk/                               # Python SDK（独立可发布包）
+│   ├── pyproject.toml
+│   └── src/
+│       └── contexthub_sdk/
+│           ├── __init__.py
+│           ├── client.py              # ContextHubClient：HTTP 封装
+│           ├── models.py              # SDK 侧 Pydantic 模型
+│           └── exceptions.py
+│
+├── plugins/                           # Agent 框架插件
+│   └── openclaw/                      # OpenClaw Plugin
+│       ├── pyproject.toml
+│       ├── plugin.py                  # 注册 tools + lifecycle hooks
+│       └── tools.py                   # contexthub_search/store/promote/feedback
+│
+├── docker-compose.yml                 # PG + ChromaDB + ContextHub Server
+├── docker-compose.dev.yml             # 开发环境覆盖（端口映射、volume 挂载）
+│
 └── tests/
     ├── conftest.py
     ├── test_context_store.py
@@ -113,7 +142,11 @@ contexthub/
 - `db/` 只做 SQL 执行，不含业务判断
 - `store/` 是 URI 路由层，协调 PG + 向量库 + ACL
 - `services/` 是业务逻辑层，依赖 `store/` 和 `db/`
+- `retrieval/` 是检索策略层，可插拔。`services/retrieval_service.py` 调用 `retrieval/router.py`
+- `ingestion/` 是内容入库管线，处理外部内容（长文档等）的预处理和写入
 - `api/` 只做 HTTP 协议转换，不含业务逻辑
+- `sdk/` 是独立包，只依赖 HTTP + Pydantic，不依赖 server 内部模块
+- `plugins/` 是 Agent 框架适配层，依赖 `sdk/`
 
 ---
 
@@ -148,6 +181,16 @@ class Settings(BaseSettings):
 
     # 传播引擎
     propagation_enabled: bool = True
+
+    # Rerank 策略
+    rerank_strategy: str = "keyword"     # "keyword" | "cross_encoder" | "llm"
+
+    # 向量库对账
+    reconcile_interval_minutes: int = 60  # 0 = 禁用
+
+    # 长文档（Phase 2 可选）
+    doc_store_root: str = "/data/docs"
+    long_document_enabled: bool = False
 ```
 
 ### 2.2 服务依赖图
@@ -233,8 +276,9 @@ async def lifespan(app: FastAPI):
 async def get_request_context(
     x_account_id: str = Header(...),
     x_agent_id: str = Header(...),
+    if_match: Optional[int] = Header(None, alias="If-Match"),  # 乐观锁版本号
 ) -> RequestContext:
-    return RequestContext(account_id=x_account_id, agent_id=x_agent_id)
+    return RequestContext(account_id=x_account_id, agent_id=x_agent_id, expected_version=if_match)
 
 def get_context_service(request: Request) -> ContextService:
     return request.app.state.context_service
@@ -256,8 +300,11 @@ async def create_context(
 ### 2.5 PropagationEngine 后台任务
 
 - 用独立的 asyncpg 连接做 `LISTEN`（不能用连接池，LISTEN 需要长连接）
-- `_on_notify` 回调中用 debounce（2 秒窗口）合并同一 URI 的多次通知
-- `process_event` 内部捕获异常，单个事件失败不影响整体
+- `_on_notify` 回调中用 debounce（2 秒窗口）合并同一 URI 的多次 NOTIFY
+- debounce 窗口结束后，`process_event` 处理该 URI 的**所有**未处理事件（不是只取最新一条）
+- `process_event` 内部捕获异常，单个依赖方处理失败不影响其他依赖方
+- 失败的事件保留 `processed = FALSE`，下次启动时自动重试
+- MVP 限制：单实例部署。多实例需要 `SELECT FOR UPDATE SKIP LOCKED`
 - lifespan shutdown 时 `cancel()` task + 关闭 LISTEN 连接
 
 ```python
@@ -267,7 +314,9 @@ class PropagationEngine:
         await self._listen_conn.add_listener("context_changed", self._on_notify)
 
     def _on_notify(self, conn, pid, channel, payload):
-        # debounce: 2 秒内同一 URI 只处理一次
+        # debounce: 2 秒内同一 URI 只触发一次处理
+        # 注意：debounce 合并的是 NOTIFY，不是事件本身。
+        # process_event 会读取该 URI 的所有未处理事件。
         source_uri = payload
         if source_uri in self._pending:
             self._pending[source_uri].cancel()
@@ -277,11 +326,12 @@ class PropagationEngine:
         )
 
     async def process_event(self, source_uri):
-        # 1. 读取未处理的 change_event
+        # 1. 读取该 URI 的所有未处理 change_events（按时间正序）
         # 2. 查询 dependencies WHERE target_uri = source_uri
-        # 3. 对每个依赖方执行 registry.get(dep_type).evaluate()
+        # 3. 对每个事件 × 每个依赖方执行 registry.get(dep_type).evaluate()
         # 4. 执行 action: mark_stale / auto_update / notify
-        # 5. 标记事件已处理
+        # 5. 每个事件处理完毕后标记 processed = TRUE
+        # 详见 06-change-propagation.md (6) 完整实现
 
     async def stop(self):
         if self._listen_conn:
@@ -338,6 +388,9 @@ class PropagationEngine:
 - `X-API-Key`: API 密钥
 - `X-Account-Id`: 租户 ID
 - `X-Agent-Id`: Agent 标识
+- `If-Match`: 乐观锁版本号（PATCH 更新时必传，对应 `contexts.version`）
+
+响应中通过 `ETag` 返回当前版本号，客户端下次更新时回传 `If-Match`。版本不匹配返回 `409 Conflict`。
 
 ---
 
@@ -437,7 +490,49 @@ class EmbeddingClient(ABC):
 检索: RetrievalService → EmbeddingClient.embed(query) → VectorStore.search() → top-K URI → PG 读 L1 rerank
 删除: LifecycleService → VectorStore.delete() / delete_batch()
 重建: 运维命令 → VectorStore.rebuild_from_pg()
+对账: 定时任务 → VectorStoreReconciler.reconcile()
 ```
+
+### PG ↔ 向量库对账机制
+
+PG 事务提交后异步更新向量库，两者可能不一致（向量库写入失败、进程崩溃等）。定时对账任务检测并修复差异：
+
+```python
+class VectorStoreReconciler:
+    """定时对账：确保 PG 中 active 状态的 context 都有对应的向量记录"""
+
+    async def reconcile(self, account_id: str):
+        # 1. 从 PG 获取所有应该在向量库中的 URI
+        pg_uris = set(row['uri'] for row in await self.pg.fetch("""
+            SELECT uri FROM contexts
+            WHERE account_id = $1 AND status IN ('active', 'stale')
+              AND l0_content IS NOT NULL
+        """, account_id))
+
+        # 2. 从向量库获取已有的 URI
+        vector_count = await self.vector_store.get_count(account_id)
+        # 如果数量差异超过阈值，触发全量重建
+        if abs(len(pg_uris) - vector_count) > len(pg_uris) * 0.1:
+            logger.warning(f"Large discrepancy: PG={len(pg_uris)}, Vector={vector_count}. Triggering rebuild.")
+            await self.vector_store.rebuild_from_pg(self.pg, account_id, self.embed_fn)
+            return
+
+        # 3. 增量修复：找出 PG 有但向量库缺失的记录，补写
+        # 通过 VectorStore.search 逐批验证存在性（或向量库提供 exists_batch API）
+        missing = await self.find_missing_in_vector(pg_uris, account_id)
+        if missing:
+            logger.info(f"Reconciling {len(missing)} missing vector records")
+            rows = await self.pg.fetch(
+                "SELECT uri, l0_content, context_type, owner_space FROM contexts WHERE uri = ANY($1)",
+                list(missing))
+            records = []
+            for row in rows:
+                embedding = await self.embed_fn(row['l0_content'])
+                records.append(VectorRecord(uri=row['uri'], vector=embedding, ...))
+            await self.vector_store.upsert_batch(records)
+```
+
+建议运行频率：每小时一次（可配置 `CTX_RECONCILE_INTERVAL_MINUTES=60`）。
 
 ---
 
@@ -517,40 +612,50 @@ L1 生成分两步，最大化确定性内容、最小化 LLM 调用：
 
 按 Phase 实施，每个 Phase 内的文件创建顺序：
 
+### Phase 0（基础设施，1 天）
+0. `docker-compose.yml` + `Dockerfile` + `.env.example`
+
 ### Phase 1（骨架，1-2 周）
 1. `pyproject.toml` + `alembic.ini`
 2. `config.py` + `models/` 全部
-3. `db/pool.py` + `db/repository.py` + `db/queries/`
-4. `alembic/versions/001_initial_schema.py`（所有核心表）
+3. `db/pool.py` + `db/repository.py`（含 RLS SET LOCAL 逻辑）+ `db/queries/`
+4. `alembic/versions/001_initial_schema.py`（所有核心表 + RLS + 索引）
 5. `vector/base.py` + `vector/chroma_store.py` + `vector/factory.py`
 6. `llm/base.py` + `llm/openai_client.py` + `llm/factory.py`
 7. `generation/` 全部
-8. `store/context_store.py`
-9. `services/acl_service.py` + `services/audit_service.py`
-10. `services/indexer_service.py`
-11. `api/deps.py` + `api/middleware.py` + `api/routers/contexts.py`
-12. `main.py`
+8. `retrieval/rerank.py`（KeywordRerankStrategy）
+9. `store/context_store.py`（含乐观锁、列名白名单）
+10. `services/acl_service.py` + `services/audit_service.py`
+11. `services/indexer_service.py`
+12. `api/deps.py` + `api/middleware.py`（含 RLS 中间件）+ `api/routers/contexts.py`
+13. `main.py`
 
 ### Phase 2A（数据湖，3-4 周）
-13. `connectors/base.py` + `connectors/mock_connector.py`
-14. `services/catalog_sync_service.py`
-15. `services/retrieval_service.py`
-16. `api/routers/datalake.py` + `api/routers/search.py`
+14. `connectors/base.py` + `connectors/mock_connector.py`
+15. `services/catalog_sync_service.py`
+16. `retrieval/router.py` + `retrieval/vector_strategy.py`
+17. `services/retrieval_service.py`
+18. `api/routers/datalake.py` + `api/routers/search.py`
 
 ### Phase 2B（多 Agent，3-4 周，与 2A 并行）
-17. `services/memory_service.py` + `services/skill_service.py`
-18. `api/routers/memories.py` + `api/routers/skills.py`
+19. `services/memory_service.py`（含 promote + approve/reject 预留接口）+ `services/skill_service.py`
+20. `api/routers/memories.py` + `api/routers/skills.py`
 
 ### Phase 2C（变更传播，2A+2B 之后）
-19. `propagation/` 全部
-20. `services/propagation_engine.py`
+21. `propagation/` 全部
+22. `services/propagation_engine.py`（含全事件处理、错误隔离、单实例注释）
 
-### Phase 2D（最小权限）
-21. `services/acl_service.py` 补充 owner_space 可见性检查
+### Phase 2D（最小权限 + 运维）
+23. `services/acl_service.py` 补充 owner_space 多团队可见性检查
+24. `services/reconciler_service.py`（向量库对账）
+
+### Phase 2E（SDK + Plugin，与 2A/2B 并行）
+25. `sdk/` 全部
+26. `plugins/openclaw/` 全部
 
 ### Phase 3（集成与评估，2 周）
-22. 两条线集成 + MVP 场景验证
-23. ECMB benchmark
+27. 两条线集成 + MVP 场景验证
+28. ECMB benchmark
 
 ---
 
@@ -560,3 +665,78 @@ L1 生成分两步，最大化确定性内容、最小化 LLM 调用：
 2. Phase 2A 完成后：`POST /api/v1/datalake/sync` 同步 Mock 数据，`POST /api/v1/search` 语义检索
 3. Phase 2C 完成后：修改湖表 schema → 观察依赖方被标记 stale
 4. 全部完成后：跑通 MVP 场景（自然语言 → 上下文检索 → SQL 生成）
+
+---
+
+## 八、基础设施
+
+### Docker Compose（开发环境）
+
+```yaml
+# docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ctx
+      POSTGRES_PASSWORD: ctx
+      POSTGRES_DB: contexthub
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ctx"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  chroma:
+    image: chromadb/chroma:latest
+    ports:
+      - "8100:8000"
+    volumes:
+      - chroma_data:/chroma/chroma
+
+  contexthub:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      CTX_PG_DSN: postgresql://ctx:ctx@postgres:5432/contexthub
+      CTX_VECTOR_BACKEND: chroma
+      CTX_CHROMA_PERSIST_DIR: /chroma_data
+      CTX_OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pg_data:
+  chroma_data:
+```
+
+### Alembic Migration 要点
+
+`alembic/versions/001_initial_schema.py` 需包含：
+- 所有核心表（contexts, dependencies, change_events, table_metadata, lineage, table_relationships, query_templates, skill_versions, access_policies, audit_log, team_memberships, lifecycle_policies, context_feedback）
+- 长文档扩展：`ALTER TABLE contexts ADD COLUMN file_path TEXT`（可选，Phase 2 启用）
+- `document_sections` 表（可选，Phase 2 启用）
+- RLS 策略 + 索引
+- `lifecycle_policies` 默认数据
+
+### 认证中间件中的 RLS 设置
+
+```python
+# api/middleware.py
+@app.middleware("http")
+async def set_rls_context(request: Request, call_next):
+    account_id = request.headers.get("X-Account-Id")
+    if account_id:
+        # 在请求级别设置 RLS 上下文
+        # PgRepository.acquire() 内部执行：
+        #   await conn.execute("SET LOCAL app.account_id = $1", account_id)
+        request.state.account_id = account_id
+    response = await call_next(request)
+    return response
+```

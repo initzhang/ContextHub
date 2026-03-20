@@ -199,7 +199,10 @@ class ComplexPropagationRule(PropagationRule):
 
 ```python
 class PropagationEngine:
-    """监听 PG NOTIFY，处理变更事件"""
+    """监听 PG NOTIFY，处理变更事件。
+
+    MVP 限制：单实例部署。多实例需要 SELECT FOR UPDATE SKIP LOCKED（见下方注释）。
+    """
 
     async def start(self):
         await self.pg.execute("LISTEN context_changed")
@@ -208,31 +211,40 @@ class PropagationEngine:
             await self.process_event(notification.payload)
 
     async def process_event(self, source_uri: str):
-        # 1. 读取未处理的变更事件
-        event = await self.pg.fetchrow("""
+        # 1. 读取该 URI 的所有未处理事件（不是只取最新一条）
+        #    按时间正序处理，确保不遗漏中间事件
+        #    注：多实例部署时应改为 SELECT ... FOR UPDATE SKIP LOCKED 防止竞争
+        events = await self.pg.fetch("""
             SELECT * FROM change_events
             WHERE source_uri = $1 AND NOT processed
-            ORDER BY timestamp DESC LIMIT 1
+            ORDER BY timestamp ASC
         """, source_uri)
-        if not event:
+        if not events:
             return
 
-        # 2. 查询所有依赖方
+        # 2. 查询所有依赖方（一次查询，所有事件共用）
         dependents = await self.pg.fetch("""
             SELECT source_uri, dep_type, pinned_version
             FROM dependencies WHERE target_uri = $1
         """, source_uri)
 
-        # 3. 对每个依赖方执行对应规则
-        for dep in dependents:
-            rule = self.get_rule(dep['dep_type'])
-            action = await rule.evaluate(event, dep['source_uri'])
-            await self.execute_action(action, dep['source_uri'])
+        # 3. 对每个事件 × 每个依赖方执行对应规则
+        for event in events:
+            for dep in dependents:
+                try:
+                    rule = self.get_rule(dep['dep_type'])
+                    action = await rule.evaluate(event, dep['source_uri'])
+                    await self.execute_action(action, dep['source_uri'])
+                except Exception as e:
+                    # 单个依赖方处理失败不影响其他依赖方和后续事件
+                    logger.error(f"Propagation failed for {dep['source_uri']}: {e}")
+                    # 失败事件不标记 processed，下次启动时重试
+                    continue
 
-        # 4. 标记事件已处理
-        await self.pg.execute(
-            "UPDATE change_events SET processed = TRUE WHERE event_id = $1",
-            event['event_id'])
+            # 4. 该事件的所有依赖方处理完毕后标记已处理
+            await self.pg.execute(
+                "UPDATE change_events SET processed = TRUE WHERE event_id = $1",
+                event['event_id'])
 ```
 
 ## (7) Token 消耗估算

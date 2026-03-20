@@ -51,6 +51,49 @@
 
 跨上下文的关联检索通过 PG `dependencies` 和 `table_relationships` 表实现（替代 `.relations.json` 文件遍历）。
 
+### Rerank 策略（可插拔）
+
+Rerank 采用 Strategy 模式，支持多种实现，按需切换：
+
+```python
+class RerankStrategy(ABC):
+    @abstractmethod
+    async def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        """对候选上下文重排序。candidates 每项包含 uri + l1_content。返回按相关性降序排列的结果。"""
+        ...
+
+class KeywordRerankStrategy(RerankStrategy):
+    """默认策略：关键词匹配 + BM25 评分。零 LLM 调用，延迟低。"""
+    async def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        query_tokens = tokenize(query)
+        scored = []
+        for c in candidates:
+            doc_tokens = tokenize(c['l1_content'])
+            score = bm25_score(query_tokens, doc_tokens)
+            scored.append({**c, '_rerank_score': score})
+        return sorted(scored, key=lambda x: x['_rerank_score'], reverse=True)
+
+class CrossEncoderRerankStrategy(RerankStrategy):
+    """高精度策略：Cross-encoder 模型打分。需要额外模型部署。预留接口，MVP 不启用。"""
+    def __init__(self, model_endpoint: str):
+        self.endpoint = model_endpoint
+
+    async def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        pairs = [(query, c['l1_content']) for c in candidates]
+        scores = await self.cross_encoder.predict(pairs)
+        for c, s in zip(candidates, scores):
+            c['_rerank_score'] = s
+        return sorted(candidates, key=lambda x: x['_rerank_score'], reverse=True)
+
+class LLMRerankStrategy(RerankStrategy):
+    """LLM 打分策略：用 LLM 判断相关性。Token 消耗高，仅用于小候选集。预留接口，MVP 不启用。"""
+    async def rerank(self, query: str, candidates: list[dict]) -> list[dict]:
+        # 批量让 LLM 对每个候选打 1-5 分
+        ...
+```
+
+MVP 阶段使用 `KeywordRerankStrategy`（BM25），配置项 `CTX_RERANK_STRATEGY=keyword`。
+
 ## 热度评分
 
 ```

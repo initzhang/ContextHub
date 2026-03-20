@@ -30,12 +30,11 @@ CREATE TABLE skill_versions (
     PRIMARY KEY (skill_uri, version)
 );
 
-CREATE TABLE skill_subscriptions (
-    subscriber_agent_id TEXT NOT NULL,
-    skill_uri           TEXT NOT NULL,
-    pinned_version      INT,                -- NULL = 跟随 latest
-    PRIMARY KEY (subscriber_agent_id, skill_uri)
-);
+-- skill_subscriptions 已合并到 dependencies 表（见 01-storage-paradigm.md）
+-- 订阅通过 dep_type='skill_subscription' 表示：
+--   source_uri = 'ctx://agent/{agent_id}'（订阅者）
+--   target_uri = skill_uri
+--   pinned_version = NULL（跟随 latest）或具体版本号
 ```
 
 ### 发布流程
@@ -80,15 +79,24 @@ async def publish_skill_version(self, skill_uri: str, content: str,
 ## (c) 记忆共享与提升
 
 ```
-Agent 私有记忆 → [提升请求] → 目标团队审核队列 → [审核通过] → 写入目标团队路径
+Agent 私有记忆 → [提升请求] → 审核流程（可选） → 写入目标团队路径
                                                     ↓
                                         [该团队及子团队 Agent 收到通知]
 ```
 
+> **MVP 阶段**：跳过审核，直接写入。但预留审核接口（`review_status` 字段 + `approve/reject` API），后续可启用。
+
 ### 提升流程（PG 事务保证原子性）
 
 ```python
-async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestContext):
+async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestContext,
+                          skip_review: bool = True):
+    """提升记忆到团队共享空间。
+
+    Args:
+        skip_review: MVP 阶段默认 True（直接写入）。
+                     设为 False 时写入 review_status='pending'，等待审核通过后再激活。
+    """
     async with self.pg.transaction():
         # 1. 读取源记忆
         source = await self.pg.fetchrow("SELECT * FROM contexts WHERE uri = $1", source_uri)
@@ -97,12 +105,13 @@ async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestCo
         target_uri = f"ctx://team/{target_team}/memories/shared_knowledge/{source['uri'].split('/')[-1]}"
 
         # 3. 写入目标团队路径
+        initial_status = 'active' if skip_review else 'pending_review'
         await self.pg.execute("""
             INSERT INTO contexts (uri, context_type, scope, owner_space, account_id,
-                l0_content, l1_content, l2_content)
-            VALUES ($1, 'memory', 'team', $2, $3, $4, $5, $6)
+                l0_content, l1_content, l2_content, status)
+            VALUES ($1, 'memory', 'team', $2, $3, $4, $5, $6, $7)
         """, target_uri, target_team, ctx.account_id,
-             source['l0_content'], source['l1_content'], source['l2_content'])
+             source['l0_content'], source['l1_content'], source['l2_content'], initial_status)
 
         # 4. 注册 derived_from 依赖（追踪来源）
         await self.pg.execute("""
@@ -113,14 +122,38 @@ async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestCo
         # 5. 发出变更事件
         await self.pg.execute("""
             INSERT INTO change_events (source_uri, change_type, actor, metadata)
-            VALUES ($1, 'created', $2, '{"promoted_from": "' || $3 || '"}')
-        """, target_uri, ctx.agent_id, source_uri)
+            VALUES ($1, 'created', $2, $3)
+        """, target_uri, ctx.agent_id,
+             json.dumps({"promoted_from": source_uri, "review_status": initial_status}))
 
         # 6. 审计日志
         await self.pg.execute("""
             INSERT INTO audit_log (actor, action, resource_uri, metadata)
             VALUES ($1, 'promote', $2, $3)
         """, ctx.agent_id, target_uri, json.dumps({"from": source_uri, "to_team": target_team}))
+
+async def approve_promotion(self, uri: str, ctx: RequestContext):
+    """审核通过：将 pending_review 状态的记忆激活。预留接口，MVP 阶段不调用。"""
+    async with self.pg.transaction():
+        await self.pg.execute("""
+            UPDATE contexts SET status = 'active', updated_at = NOW()
+            WHERE uri = $1 AND status = 'pending_review'
+        """, uri)
+        await self.pg.execute("""
+            INSERT INTO audit_log (actor, action, resource_uri, metadata)
+            VALUES ($1, 'approve_promotion', $2, '{}')
+        """, ctx.agent_id, uri)
+    await self.pg.execute("NOTIFY context_changed, $1", uri)
+
+async def reject_promotion(self, uri: str, reason: str, ctx: RequestContext):
+    """审核拒绝：删除 pending_review 状态的记忆。预留接口，MVP 阶段不调用。"""
+    async with self.pg.transaction():
+        await self.pg.execute("DELETE FROM contexts WHERE uri = $1 AND status = 'pending_review'", uri)
+        await self.pg.execute("DELETE FROM dependencies WHERE source_uri = $1", uri)
+        await self.pg.execute("""
+            INSERT INTO audit_log (actor, action, resource_uri, metadata)
+            VALUES ($1, 'reject_promotion', $2, $3)
+        """, ctx.agent_id, uri, json.dumps({"reason": reason}))
 ```
 
 示例：后端组 Agent 的一个 SQL pattern 提升到工程部共享

@@ -102,7 +102,7 @@ MVP 阶段采用单 OpenClaw 实例作为 DataAgent 运行时。通过 ContextHu
 |------|------|-------------|
 | Context Service | 上下文 CRUD、L0/L1/L2 管理 | `contexts` |
 | Memory Service | 记忆提取、去重、热度管理、共享/提升 | `contexts`, `dependencies` |
-| Skill Service | Skill 定义、版本管理、发布/订阅 | `contexts`, `skill_versions`, `skill_subscriptions` |
+| Skill Service | Skill 定义、版本管理、发布/订阅 | `contexts`, `skill_versions`, `dependencies`（dep_type='skill_subscription'） |
 | Retrieval Engine | 向量检索 L0 → PG 读 L1 精排 → 按需加载 L2 | 向量库 + `contexts` |
 | Indexer | 内容变更时异步生成 L0/L1、更新向量索引 | `contexts` → 向量库 |
 | Propagation Engine | 监听 NOTIFY → 查依赖方 → 执行规则 | `change_events`, `dependencies` |
