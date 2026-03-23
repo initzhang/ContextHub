@@ -55,12 +55,12 @@ LIMIT 1;
 例外：根团队管理员可以为特定子团队设置"豁免"（exempt）
 ```
 
-实现方式：评估时查询 agent 的完整团队路径链（从 `team_memberships` 表获取），对每一层级检查是否有 deny 策略：
+实现方式：评估时查询 agent 的完整团队路径链（`teams` 表经 `parent_id` 的递归 CTE 自 `team_memberships` 解析出可见团队，再展开为路径前缀列表），对每一层级检查是否有 deny 策略：
 
 ```python
 async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool:
-    # 获取 agent 的团队路径链：['engineering/backend', 'engineering', '']
-    team_paths = await self.get_team_hierarchy(ctx.agent_id)
+    # 获取 agent 可见团队对应的路径链（如 ['engineering/backend', 'engineering', '']），供 principal = ANY($4)
+    team_paths = await self.get_visible_team_paths(ctx.agent_id)
 
     # 查询所有匹配的策略（一次 SQL）
     policies = await self.pg.fetch("""
@@ -81,6 +81,8 @@ async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool
     # 无匹配策略：默认 deny
     return False
 ```
+
+`get_visible_team_paths` 的实现：由 `team_memberships` 得到 agent 所属 `team_id`，再对 `teams` 用 `parent_id` 做递归 CTE 向上遍历祖先，将每条 team 的路径片段拼成与 `principal` / `resource_uri_pattern` 对齐的字符串列表（不再依赖 `owner_space` 字符串劈分模拟层级）。
 
 ### 字段脱敏
 

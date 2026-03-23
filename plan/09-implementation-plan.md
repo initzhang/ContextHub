@@ -229,59 +229,73 @@ await ctx.memory.promote(
 | ACL/隔离/版本管理 | 不可量化 | pass/fail | Tier 3 功能测试 |
 | 反馈生命周期 | 不可量化（需长期数据）| pass/fail | Tier 3 功能测试 |
 
-## 实施计划（并行推进）
+## 实施计划（聚焦线 B）
+
+MVP 聚焦多 Agent 协作（线 B），数据湖管理（线 A）可用但不做量化 benchmark。ACL（deny-override、RLS）、反馈/生命周期、审计日志后置到 MVP 后。
 
 ### Phase 1: 项目骨架 & 核心抽象（1-2 周）
 1. 初始化项目（Python, FastAPI, pyproject.toml）
 2. PG 数据库初始化：
-   - 创建所有核心表（contexts, dependencies, change_events, table_metadata, lineage, table_relationships, query_templates, skill_versions, access_policies, audit_log, team_memberships, lifecycle_policies, context_feedback）
-   - 配置 RLS 策略
+   - 创建核心表（contexts, dependencies, change_events, teams, team_memberships, skill_versions, table_metadata, lineage, table_relationships, query_templates）
    - 创建索引
-3. 实现 ContextStore（URI 路由层）：ctx:// URI → PG 读写 + ACL 检查
-4. 实现 pgvector 集成：L0 embedding 列 + HNSW 索引，写入/检索与 PG 事务统一
+   - 注：access_policies、audit_log、lifecycle_policies、context_feedback 后置到 MVP 后
+3. 实现 ContextStore（URI 路由层）：ctx:// URI → PG 读写（MVP 阶段仅 agent_id 级隔离，无 ACL）
+4. 实现 pgvector 集成：L0 embedding 列 + HNSW 索引
 5. 实现 MockCatalogConnector（硬编码几张表的元数据）
 6. 设计并实现 Python SDK 接口
 
 ### Phase 2: 两条线并行（3-4 周）
 
-线 A — 数据湖表上下文管理：
+线 A — 数据湖表上下文管理（可用即可，不做 benchmark）：
 7. 湖表元数据的 L0/L1 自动生成（CatalogConnector → LLM 生成摘要 → 写入 PG）
 8. Retrieval Engine（向量检索 L0 → PG 读 L1 精排 → 按需加载结构化数据）
 9. Text-to-SQL 上下文组装逻辑（PG JOIN 查询：schema + 关系 + 模板 + 业务术语）
 10. 实现 ContextHub OpenClaw Plugin，对接 DataAgent，跑通"自然语言 → 上下文检索 → SQL 生成"链路
 
-线 B — 多 Agent 协作 + 变更传播 + 质量闭环：
-11. 多层级团队模型（team_memberships 表）+ ACL（access_policies 表 + RLS + deny-override）
+线 B — 多 Agent 协作 + 变更传播（MVP 核心）：
+11. 多层级团队模型（teams + team_memberships 表 + 递归 CTE 可见性展开）
 12. Memory Service（提取、去重、热度更新、共享提升 — 全部 PG 事务操作）
 13. Skill Service（skill_versions 表、发布/订阅、is_breaking 标记）
 14. Propagation Engine（PG LISTEN/NOTIFY + dependencies 表查询 + PropagationRule 三级响应）
-15. Feedback Collector（context_feedback 表 + adopted/ignored 计数更新 + 低质量报告 SQL）
-16. Lifecycle Manager（contexts.status 状态机 + lifecycle_policies 表 + 定时 SQL 任务）
 
 ### Phase 3: 集成与评估（2-3 周）
 
-**Step 17: 测试数据集准备（3-4 天）**
-- 从 BIRD 数据集选取 5-8 个业务复杂度高的数据库，提取 30-50 张表
-- 补充企业级元素：table_relationships（40-60 条 JOIN 关系）、lineage（15-20 条血缘）、query_templates（100-150 条）、business_terms（30-50 条）
-- 筛选 200-300 条自然语言问题，按复杂度标注：单表 / 2 表 JOIN / 3+ 表 JOIN / 含业务术语
+**Step 15: 测试数据集准备（2-3 天）**
+- 构造多 Agent 工作流数据：query-agent 10-15 轮学习 episode、5-8 次记忆晋升
 - 构造变更传播场景：10-15 次 schema 变更事件、5-8 次 Skill 版本更新
-- 构造多 Agent 工作流：query-agent 10-15 轮学习 episode、5-8 次记忆晋升
+- 准备 demo 场景数据
 
-**Step 18: Tier 1 量化 Benchmark + Tier 2 A/B 消融实验（5-7 天）**
-- 实现 Baseline：平坦 RAG（所有 schema 切 chunk → 向量检索 → top-K 塞入 prompt）
-- 跑 4 组 A/B 实验，每组对比 Tier 1 指标（EX, Token, Precision@5, Latency）
-- 按查询复杂度子集分析结果（单表 / 多表 JOIN / 业务术语）
-- 统计显著性检验（paired t-test 或 bootstrap）
+**Step 16: Tier 3 功能正确性测试（3-4 天）**
+- pytest + httpx 实现核心 Tier 3 测试用例（传播 P-1~P-6、协作 C-1~C-5）
+- CI 集成
 
-**Step 19: Tier 3 功能正确性测试（2-3 天）**
-- pytest + httpx 实现所有 Tier 3 测试用例（传播 P-1~P-6、协作 C-1~C-5、ACL A-1~A-4、反馈 F-1~F-5）
-- CI 集成，确保每次代码变更不破坏功能正确性
+**Step 17: 端到端 demo 场景（2-3 天）**
+- 构造完整的多 Agent 协作 demo：Agent A 更新 Skill → 传播引擎标记 Agent B 依赖为 stale → Agent B 检索时获取更新后的上下文
+- 对比"纯 OpenClaw 上下文管理" vs "ContextHub 结构化注入"的端到端 token 消耗
 
-**Step 20: 评估报告（1-2 天）**
-- 汇总 Tier 1 指标对比表 + Tier 2 消融实验结果
-- 按设计优势维度组织：分层检索效果、结构化组装效果、传播效果、协作效果
-- 诚实标注各指标的置信度和局限性
-- 输出可复现的评估脚本和数据集
+**Step 18: 评估报告（1-2 天）**
+- Tier 3 功能测试结果
+- 端到端 demo 录制/文档
+- 与 Mem0/CrewAI/Governed Memory 的功能对比表
+- Token 消耗对比：ContextHub vs 纯 OpenClaw
+- 诚实标注局限性和后续计划
+
+## MVP 成功标准
+
+| 维度 | 标准 | 说明 |
+|------|------|------|
+| 功能正确性 | Tier 3 测试全部 pass | 传播 P-1~P-6、协作 C-1~C-5 |
+| 端到端 demo | 完整多 Agent 协作场景可演示 | Skill 更新 → 传播 → 下游感知 |
+| 功能对比 | 对比表展示 vs Mem0/CrewAI/Governed Memory | 层级继承、变更传播、Skill 版本管理、记忆晋升 |
+| Token 效率 | vs 纯 OpenClaw 端到端 token 减少 x% | 结构化注入 vs 全量对话历史 |
+
+### MVP 后续（非 MVP 范围）
+
+以下功能在 MVP 验证核心假设后按优先级实施：
+1. ACL（deny-override、RLS 策略）+ 审计日志
+2. 反馈与生命周期管理（显式反馈 → 隐式反馈）
+3. Tier 1/2 量化 Benchmark（BIRD 数据集 + 消融实验）
+4. MCP Server 接口（详见 12-evolution-notes.md）
 
 ## 技术选型
 

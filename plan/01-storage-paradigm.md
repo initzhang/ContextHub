@@ -66,10 +66,11 @@ ctx://
 
 ```sql
 CREATE TABLE contexts (
-    uri             TEXT PRIMARY KEY,       -- ctx://datalake/prod/orders
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    uri             TEXT NOT NULL UNIQUE,    -- ctx://datalake/prod/orders（对外接口用 URI，对内 JOIN 用 UUID）
     context_type    TEXT NOT NULL,           -- 'table_schema' | 'skill' | 'memory' | 'resource'
     scope           TEXT NOT NULL,           -- 'datalake' | 'team' | 'agent' | 'user'
-    owner_space     TEXT,                    -- 团队路径如 'engineering/backend'，或 agent_id
+    owner_space     TEXT,                    -- 团队路径如 'engineering/backend'（须匹配 teams.path），或 agent_id
     account_id      TEXT NOT NULL,           -- 租户隔离
 
     -- L0/L1/L2 内容（TOAST 自动处理大文本）
@@ -114,16 +115,16 @@ CREATE INDEX idx_contexts_status ON contexts (status) WHERE status != 'deleted';
 ```sql
 CREATE TABLE dependencies (
     id              SERIAL PRIMARY KEY,
-    source_uri      TEXT NOT NULL REFERENCES contexts(uri),  -- 依赖方（Agent context 或 Agent 自身 URI）
-    target_uri      TEXT NOT NULL,                           -- 被依赖方
+    dependent_id    UUID NOT NULL REFERENCES contexts(id),   -- 依赖方（"我依赖别人"的"我"）
+    dependency_id   UUID NOT NULL REFERENCES contexts(id),   -- 被依赖方（"我依赖别人"的"别人"）
     dep_type        TEXT NOT NULL,           -- 'skill_version' | 'table_schema' | 'derived_from' | 'skill_subscription'
     pinned_version  TEXT,                    -- 依赖的特定版本（NULL = 跟随 latest）
     created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (source_uri, target_uri, dep_type)
+    UNIQUE (dependent_id, dependency_id, dep_type)
 );
 
-CREATE INDEX idx_deps_target ON dependencies (target_uri);  -- 变更传播时按 target 查依赖方
-CREATE INDEX idx_deps_source ON dependencies (source_uri);  -- 查某个 Agent 的所有依赖
+CREATE INDEX idx_deps_dependency ON dependencies (dependency_id);  -- 变更传播时按被依赖方查找所有依赖方
+CREATE INDEX idx_deps_dependent ON dependencies (dependent_id);    -- 查某个 context 的所有依赖
 ```
 
 dep_type 语义：
@@ -138,7 +139,7 @@ dep_type 语义：
 CREATE TABLE change_events (
     event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     timestamp       TIMESTAMPTZ DEFAULT NOW(),
-    source_uri      TEXT NOT NULL,
+    context_id      UUID NOT NULL REFERENCES contexts(id),  -- 发生变更的 context
     change_type     TEXT NOT NULL,           -- 'created' | 'modified' | 'deleted' | 'version_published'
     actor           TEXT NOT NULL,           -- agent_id | 'system' | 'catalog_sync'
     diff_summary    TEXT,                    -- ~50 tokens
@@ -149,6 +150,7 @@ CREATE TABLE change_events (
 );
 
 CREATE INDEX idx_events_unprocessed ON change_events (timestamp) WHERE NOT processed;
+CREATE INDEX idx_events_context ON change_events (context_id);
 ```
 
 ### audit_log 表
@@ -184,12 +186,12 @@ CREATE TABLE access_policies (
 
 ## 向量索引层
 
-L0 摘要被向量化后存入 PG 的 pgvector 列，用于语义检索。元数据、内容、向量索引全部在同一个 PG 实例中，天然事务一致。
+L0 摘要被向量化后存入 PG 的 pgvector 列，用于语义检索。元数据、内容、向量索引全部在同一个 PG 实例中，消除了跨系统双写的一致性问题。
 
 | 数据 | 存储位置 | 说明 |
 |------|----------|------|
 | URI、元数据、L0/L1/L2 内容、状态、版本 | PG 结构化列 | 权威数据源，支持事务 |
-| L0 embedding | PG `l0_embedding` 列（pgvector `vector` 类型） | HNSW 索引加速检索，与内容同事务更新 |
+| L0 embedding | PG `l0_embedding` 列（pgvector `vector` 类型） | HNSW 索引加速检索，与内容同库存储 |
 
 ### pgvector 列定义
 
@@ -206,7 +208,7 @@ CREATE INDEX idx_contexts_l0_embedding ON contexts
 向量检索直接在 PG 中完成，可与标量过滤在同一查询中组合：
 
 ```sql
-SELECT uri, l0_content, context_type,
+SELECT id, uri, l0_content, context_type,
        l0_embedding <=> $1 AS distance
 FROM contexts
 WHERE account_id = $2
@@ -218,7 +220,7 @@ LIMIT 20;
 
 **与 OpenViking 的区别：** OpenViking 将 L0/L1/L2 三个层级都入向量库（通过 `level` 字段区分）。ContextHub 只对 L0 做向量化——L1/L2 内容在同一 PG 表的其他列中，通过 URI 直接读取。原因：向量检索的目的是找到相关上下文（L0 足够），精排和详情加载直接查 PG（更快、更一致）。
 
-**与独立向量库方案的区别：** 早期设计考虑过 ChromaDB/Milvus 作为独立向量库，但引入了双写一致性问题（PG 写成功但向量库写失败）和额外基础设施运维。ContextHub 只向量化 L0 摘要（~100 tokens/条，万级规模），pgvector 的 HNSW 索引完全胜任。统一到 PG 后，向量更新与内容更新可在同一事务中完成，架构最简。
+**与独立向量库方案的区别：** 早期设计考虑过 ChromaDB/Milvus 作为独立向量库，但引入了双写一致性问题（PG 写成功但向量库写失败）和额外基础设施运维。ContextHub 只向量化 L0 摘要（~100 tokens/条，万级规模），pgvector 的 HNSW 索引完全胜任。统一到 PG 后消除了跨系统双写问题，架构最简。注意：embedding 生成需调用外部 API（如 OpenAI text-embedding-3-small），因此与内容写入不在同一事务中——内容先写入，embedding 异步回填。`EmbeddingReconciler` 定时检测缺失的 embedding 并补写，保证最终一致性。在 embedding 就绪前，新写入的 context 可通过 URI 直接访问，但不会出现在向量检索结果中。
 
 ### 检索流程
 
@@ -237,8 +239,8 @@ LIMIT 20;
 
 | 关系类型 | PG 表 | 查询方式 |
 |----------|-------|----------|
-| 上下文依赖（Skill 版本、表 schema） | `dependencies` | `SELECT * FROM dependencies WHERE target_uri = $1` |
-| Skill 订阅 | `dependencies`（dep_type='skill_subscription'） | `SELECT * FROM dependencies WHERE source_uri = $1 AND dep_type = 'skill_subscription'` |
+| 上下文依赖（Skill 版本、表 schema） | `dependencies` | `SELECT * FROM dependencies WHERE dependency_id = $1` |
+| Skill 订阅 | `dependencies`（dep_type='skill_subscription'） | `SELECT * FROM dependencies WHERE dependent_id = $1 AND dep_type = 'skill_subscription'` |
 | 表间 JOIN 关系 | `table_relationships`（见 03） | SQL JOIN |
 | 数据血缘 | `lineage`（见 03） | 递归 CTE 遍历 |
 
@@ -266,31 +268,32 @@ Agent 所属团队路径: team/engineering/backend, team/data/analytics（支持
   9. ctx://resources/                 ← 文档资源（受 ACL 控制）
 ```
 
-实现方式：从 `team_memberships` 动态展开所有团队路径及其祖先，通过 `owner_space = ANY($visible_spaces)` 匹配：
+实现方式：通过 `teams` 表的 `parent_id` 递归 CTE 展开 Agent 所属团队及其所有祖先，再通过 `owner_space` 匹配：
 
-```python
-async def get_visible_owner_spaces(self, agent_id: str) -> list[str]:
-    """展开 Agent 的所有可见 owner_space（含祖先链）"""
-    team_paths = await self.pg.fetch(
-        "SELECT team_path FROM team_memberships WHERE agent_id = $1", agent_id)
-    spaces = set()
-    spaces.add('')  # 根团队（owner_space = '' 或 NULL）
-    for row in team_paths:
-        path = row['team_path']
-        # 展开祖先链：'engineering/backend' → ['engineering/backend', 'engineering', '']
-        parts = path.split('/')
-        for i in range(len(parts)):
-            spaces.add('/'.join(parts[:i+1]))
-    return list(spaces)
+```sql
+-- 递归展开 Agent 所属团队及其所有祖先
+WITH RECURSIVE visible_teams AS (
+    -- 基础：Agent 直接所属的团队
+    SELECT t.id, t.path, t.parent_id
+    FROM teams t
+    JOIN team_memberships tm ON t.id = tm.team_id
+    WHERE tm.agent_id = $1
+    UNION ALL
+    -- 递归：所有祖先团队
+    SELECT t.id, t.path, t.parent_id
+    FROM teams t
+    JOIN visible_teams vt ON t.id = vt.parent_id
+)
+SELECT path FROM visible_teams;
 ```
 
 ```sql
--- 可见性查询（支持多团队归属）
--- $visible_spaces 由 get_visible_owner_spaces() 生成
+-- 可见性查询（支持多团队归属 + 层级继承）
+-- $visible_paths 由上述递归 CTE 生成
 SELECT * FROM contexts
 WHERE account_id = $1
   AND (
-    owner_space = ANY($visible_spaces)              -- 所有可见团队（含祖先链）
+    owner_space = ANY($visible_paths)                -- 所有可见团队（含祖先链）
     OR scope IN ('datalake', 'resources')            -- 公共资源（受 ACL 进一步控制）
     OR (scope = 'agent' AND owner_space = $agent_id) -- 私有空间
   );
@@ -309,16 +312,32 @@ WHERE account_id = $1
 - 方案 1：提升到共同祖先 `ctx://team/` — 简单但范围过大
 - 方案 2：通过 `dependencies` 表建立跨团队引用 — 精准但需要权限（更合理）
 
+### 团队层级定义
+
+```sql
+CREATE TABLE teams (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    path        TEXT NOT NULL UNIQUE,       -- 'engineering/backend'
+    parent_id   UUID REFERENCES teams(id),  -- 指向 'engineering' 的 UUID（根团队 parent_id = NULL）
+    display_name TEXT,                       -- '后端工程团队'
+    account_id  TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_teams_parent ON teams (parent_id);
+CREATE INDEX idx_teams_account ON teams (account_id);
+```
+
 ### Agent 多团队归属
 
 ```sql
 CREATE TABLE team_memberships (
     agent_id    TEXT NOT NULL,
-    team_path   TEXT NOT NULL,          -- 如 'engineering/backend'
+    team_id     UUID NOT NULL REFERENCES teams(id),  -- FK 约束确保只能加入已注册的团队
     role        TEXT DEFAULT 'member',  -- 'member' | 'admin'
     access      TEXT DEFAULT 'read_write', -- 'read_write' | 'read_only'
     is_primary  BOOLEAN DEFAULT FALSE,  -- 主团队（写入共享记忆的默认目标）
-    PRIMARY KEY (agent_id, team_path)
+    PRIMARY KEY (agent_id, team_id)
 );
 ```
 
@@ -337,9 +356,9 @@ class ContextStore:
     async def read(self, uri: str, level: ContextLevel, ctx: RequestContext) -> str:
         # 1. 权限检查（PG access_policies 表）
         await self.acl.check_access(uri, ctx, action='read')
-        # 2. 从 PG 读取对应层级的内容
+        # 2. 从 PG 读取对应层级的内容（URI → PG 查询，内部通过 UNIQUE 索引定位）
         row = await self.db.fetchrow(
-            "SELECT l0_content, l1_content, l2_content FROM contexts WHERE uri = $1", uri)
+            "SELECT id, l0_content, l1_content, l2_content FROM contexts WHERE uri = $1", uri)
         content = row[f'l{level.value}_content']
         # 3. 字段脱敏（如有）
         return await self.acl.apply_field_masks(content, uri, ctx)
@@ -359,12 +378,13 @@ class ContextStore:
             """, content, uri, ctx.expected_version)
             if result == 'UPDATE 0':
                 raise ConcurrentModificationError(f"URI {uri} has been modified by another writer")
-            # 3. 发出变更事件（同一事务内）
+            # 3. 发出变更事件（同一事务内，使用 context UUID）
+            context_id = await self.db.fetchval("SELECT id FROM contexts WHERE uri = $1", uri)
             await self.db.execute(
-                "INSERT INTO change_events (source_uri, change_type, actor) VALUES ($1, 'modified', $2)",
-                uri, ctx.agent_id)
-        # 4. 事务提交后，PG NOTIFY 触发传播引擎（异步）
-        await self.db.execute("NOTIFY context_changed, $1", uri)
+                "INSERT INTO change_events (context_id, change_type, actor) VALUES ($1, 'modified', $2)",
+                context_id, ctx.agent_id)
+        # 4. 事务提交后，PG NOTIFY 触发传播引擎（异步，payload 为 context UUID）
+        await self.db.execute("NOTIFY context_changed, $1", str(context_id))
 
     async def search(self, query: str, ctx: RequestContext, **filters) -> list[Context]:
         # 1. 生成查询 embedding
@@ -448,7 +468,7 @@ class ContextTools:
     async def stat(self, uri: str) -> dict:
         """查看上下文的元信息（不读内容）"""
         row = await self.store.db.fetchrow("""
-            SELECT uri, context_type, scope, owner_space, status, version,
+            SELECT id, uri, context_type, scope, owner_space, status, version,
                    active_count, updated_at
             FROM contexts WHERE uri = $1
         """, uri)

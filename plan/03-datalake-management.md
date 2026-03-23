@@ -19,7 +19,7 @@
 ```sql
 -- 数据湖表的结构化元数据（contexts 表的扩展）
 CREATE TABLE table_metadata (
-    context_uri     TEXT PRIMARY KEY REFERENCES contexts(uri),
+    context_id      UUID PRIMARY KEY REFERENCES contexts(id),
     catalog         TEXT NOT NULL,          -- 'hive' | 'iceberg' | 'delta'
     database_name   TEXT NOT NULL,
     table_name      TEXT NOT NULL,
@@ -32,27 +32,27 @@ CREATE TABLE table_metadata (
 
 -- 数据血缘（有向图）
 CREATE TABLE lineage (
-    source_uri      TEXT NOT NULL,          -- 上游表
-    target_uri      TEXT NOT NULL,          -- 下游表
+    upstream_id     UUID NOT NULL REFERENCES contexts(id),  -- 上游表
+    downstream_id   UUID NOT NULL REFERENCES contexts(id),  -- 下游表
     transform_type  TEXT,                   -- 'etl' | 'view' | 'derived'
     description     TEXT,
-    PRIMARY KEY (source_uri, target_uri)
+    PRIMARY KEY (upstream_id, downstream_id)
 );
 
 -- 表间 JOIN 关系
 CREATE TABLE table_relationships (
-    table_uri_a     TEXT NOT NULL,
-    table_uri_b     TEXT NOT NULL,
+    table_id_a      UUID NOT NULL REFERENCES contexts(id),
+    table_id_b      UUID NOT NULL REFERENCES contexts(id),
     join_type       TEXT,                   -- 'fk' | 'common_join' | 'inferred'
     join_columns    JSONB NOT NULL,         -- [{"a": "user_id", "b": "id"}]
     confidence      FLOAT DEFAULT 1.0,     -- 推断关系的置信度
-    PRIMARY KEY (table_uri_a, table_uri_b)
+    PRIMARY KEY (table_id_a, table_id_b)
 );
 
 -- 查询模板
 CREATE TABLE query_templates (
     id              SERIAL PRIMARY KEY,
-    context_uri     TEXT NOT NULL REFERENCES contexts(uri),
+    context_id      UUID NOT NULL REFERENCES contexts(id),
     sql_template    TEXT NOT NULL,
     description     TEXT,
     hit_count       INT DEFAULT 0,
@@ -60,7 +60,7 @@ CREATE TABLE query_templates (
     created_by      TEXT                    -- agent_id
 );
 
-CREATE INDEX idx_qt_context ON query_templates (context_uri);
+CREATE INDEX idx_qt_context ON query_templates (context_id);
 ```
 
 ### 湖表 Context 示例
@@ -77,7 +77,7 @@ contexts 表:
   l2_content:   NULL  ← 数据湖表不用此列，改用结构化子表
 
 table_metadata 表:
-  context_uri:  ctx://datalake/hive/prod/orders
+  context_id:   <该表对应 contexts 行的 UUID 主键>
   catalog:      hive
   database_name: prod
   table_name:   orders
@@ -87,14 +87,14 @@ table_metadata 表:
   sample_data:  [{"order_id": 1001, "user_id": 42, "amount": 299.00, "status": "completed"}]
 
 table_relationships 表:
-  table_uri_a:  ctx://datalake/hive/prod/orders
-  table_uri_b:  ctx://datalake/hive/prod/users
+  table_id_a:   <orders 表对应 contexts.id>
+  table_id_b:   <users 表对应 contexts.id>
   join_type:    fk
   join_columns: [{"a": "user_id", "b": "id"}]
 
 lineage 表:
-  source_uri:   ctx://datalake/hive/ods/ods_orders
-  target_uri:   ctx://datalake/hive/prod/orders
+  upstream_id:   <ods_orders 对应 contexts.id>
+  downstream_id: <prod/orders 对应 contexts.id>
   transform_type: etl
   description:  "ODS 层清洗后写入 prod"
 ```
@@ -104,14 +104,14 @@ lineage 表:
 ```sql
 -- 统计信息更新：不触发下游传播（行数变了不代表 schema 变了）
 UPDATE table_metadata SET stats = $1, stats_updated_at = NOW()
-WHERE context_uri = $2;
+WHERE context_id = $2;
 -- 不插入 change_event，不通知任何人
 
 -- schema 变更：触发传播
 BEGIN;
-  UPDATE table_metadata SET ddl = $1 WHERE context_uri = $2;
-  UPDATE contexts SET version = version + 1, updated_at = NOW() WHERE uri = $2;
-  INSERT INTO change_events (source_uri, change_type, actor, diff_summary)
+  UPDATE table_metadata SET ddl = $1 WHERE context_id = $2;
+  UPDATE contexts SET version = version + 1, updated_at = NOW() WHERE id = $2;
+  INSERT INTO change_events (context_id, change_type, actor, diff_summary)
     VALUES ($2, 'modified', 'catalog_sync', 'schema 变更: 新增字段 discount_rate DECIMAL');
 COMMIT;
 -- PG NOTIFY → 传播引擎标记依赖此表的 Skill/cases 为 stale
@@ -139,25 +139,27 @@ async def sync_table(self, catalog: str, db: str, table: str):
     uri = f"ctx://datalake/{catalog}/{db}/{table}"
 
     async with self.pg.transaction():
-        # 1. 更新或创建 contexts 行（L0/L1 由 LLM 生成）
-        await self.pg.execute("""
+        # 1. 更新或创建 contexts 行（L0/L1 由 LLM 生成）；id 由 DB 生成，RETURNING 取回
+        row = await self.pg.fetchrow("""
             INSERT INTO contexts (uri, context_type, scope, l0_content, l1_content, account_id)
             VALUES ($1, 'table_schema', 'datalake', $2, $3, $4)
             ON CONFLICT (uri) DO UPDATE SET l1_content = $3, updated_at = NOW()
+            RETURNING id
         """, uri, generate_l0(schema), generate_l1(schema), account_id)
+        context_id = row["id"]
 
         # 2. 更新 table_metadata
         await self.pg.execute("""
-            INSERT INTO table_metadata (context_uri, catalog, database_name, table_name, ddl, stats)
+            INSERT INTO table_metadata (context_id, catalog, database_name, table_name, ddl, stats)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (context_uri) DO UPDATE SET ddl = $5, stats = $6, stats_updated_at = NOW()
-        """, uri, catalog, db, table, schema.ddl, stats.to_json())
+            ON CONFLICT (context_id) DO UPDATE SET ddl = $5, stats = $6, stats_updated_at = NOW()
+        """, context_id, catalog, db, table, schema.ddl, stats.to_json())
 
         # 3. 如果 DDL 变了，插入变更事件
         if schema_changed:
             await self.pg.execute(
-                "INSERT INTO change_events (source_uri, change_type, actor) VALUES ($1, 'modified', 'catalog_sync')",
-                uri)
+                "INSERT INTO change_events (context_id, change_type, actor) VALUES ($1, 'modified', 'catalog_sync')",
+                context_id)
 ```
 
 ## (c) Text-to-SQL 上下文组装
@@ -167,21 +169,21 @@ async def sync_table(self, catalog: str, db: str, table: str):
 ```sql
 -- 输入：pgvector 检索返回的相关表 URI 列表 $relevant_uris
 SELECT
-    c.uri, c.l0_content, c.l1_content,
+    c.id, c.uri, c.l0_content, c.l1_content,
     tm.ddl, tm.partition_info, tm.sample_data,
     -- 聚合该表的 JOIN 关系
     (SELECT jsonb_agg(jsonb_build_object(
-        'related_table', CASE WHEN tr.table_uri_a = c.uri THEN tr.table_uri_b ELSE tr.table_uri_a END,
+        'related_table', CASE WHEN tr.table_id_a = c.id THEN tr.table_id_b ELSE tr.table_id_a END,
         'join_columns', tr.join_columns))
      FROM table_relationships tr
-     WHERE tr.table_uri_a = c.uri OR tr.table_uri_b = c.uri
+     WHERE tr.table_id_a = c.id OR tr.table_id_b = c.id
     ) AS joins,
     -- 聚合该表的查询模板（按使用频率排序，取 top 5）
     (SELECT jsonb_agg(jsonb_build_object('sql', qt.sql_template, 'description', qt.description))
-     FROM (SELECT * FROM query_templates WHERE context_uri = c.uri ORDER BY hit_count DESC LIMIT 5) qt
+     FROM (SELECT * FROM query_templates WHERE context_id = c.id ORDER BY hit_count DESC LIMIT 5) qt
     ) AS top_templates
 FROM contexts c
-JOIN table_metadata tm ON tm.context_uri = c.uri
+JOIN table_metadata tm ON tm.context_id = c.id
 WHERE c.uri = ANY($relevant_uris);
 ```
 
@@ -196,11 +198,11 @@ WHERE c.uri = ANY($relevant_uris);
 ```sql
 -- 查找 orders 表的所有上游数据源
 WITH RECURSIVE upstream AS (
-    SELECT source_uri, target_uri, 1 AS depth
-    FROM lineage WHERE target_uri = 'ctx://datalake/hive/prod/orders'
+    SELECT upstream_id, downstream_id, 1 AS depth
+    FROM lineage WHERE downstream_id = (SELECT id FROM contexts WHERE uri = 'ctx://datalake/hive/prod/orders')
     UNION ALL
-    SELECT l.source_uri, l.target_uri, u.depth + 1
-    FROM lineage l JOIN upstream u ON l.target_uri = u.source_uri
+    SELECT l.upstream_id, l.downstream_id, u.depth + 1
+    FROM lineage l JOIN upstream u ON l.downstream_id = u.upstream_id
     WHERE u.depth < 5  -- 最多追溯 5 跳
 )
 SELECT * FROM upstream;

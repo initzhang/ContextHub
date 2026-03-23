@@ -107,3 +107,37 @@ class RedisStreamConsumer(EventConsumer):
 - 消息队列作为通知加速层，不替代 PG 存储
 - 需要处理 exactly-once 语义（outbox + 消费者幂等）
 - 候选技术：Redis Streams（轻量）、NATS JetStream（云原生）、Kafka（重量级，大概率不需要）
+
+---
+
+## C. 对外接口：SDK-only → MCP Server
+
+### 现状
+
+MVP 阶段 ContextHub 通过 Python SDK + OpenClaw Plugin 对接 Agent。只有 OpenClaw 用户能使用 ContextHub。
+
+### 为什么需要 MCP
+
+Anthropic 的 Model Context Protocol (MCP) 已成为 Agent 连接外部数据源的事实标准。ContextHub 作为"上下文管理中间件"，天然适合暴露为 MCP Server。提供 MCP 接口后，ContextHub 可以被任何支持 MCP 的 Agent 框架使用（Claude Desktop, Cursor, Cline, 各种 LangGraph agent 等），不再硬绑定 OpenClaw。
+
+### 升级方案
+
+将 ContextHub 的核心操作映射为 MCP tools/resources：
+
+| ContextHub 操作 | MCP 映射 |
+|-----------------|----------|
+| `ls` | MCP Resource（列出 ctx:// 路径下的子项） |
+| `read` | MCP Resource（读取 context 内容） |
+| `grep` | MCP Tool（语义搜索） |
+| `stat` | MCP Tool（查看元信息） |
+| `contexthub_store` | MCP Tool（写入记忆） |
+| `contexthub_promote` | MCP Tool（提升记忆） |
+| `contexthub_feedback` | MCP Tool（报告反馈） |
+
+OpenClaw Plugin 可以作为 MCP 之上的薄包装——Plugin 内部通过 MCP 客户端调用 ContextHub MCP Server，而非直接调用 SDK。
+
+### 何时需要升级
+
+- 需要支持 OpenClaw 以外的 Agent 框架
+- 希望 ContextHub 可以直接在 Claude Desktop / Cursor 等工具中使用
+- 需要标准化的 Agent-Tool 对接协议

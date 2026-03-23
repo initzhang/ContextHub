@@ -37,10 +37,6 @@
 │  │  │ Auth &   │ │ Audit    │ │ Version      │    │    │
 │  │  │ ACL      │ │ Logger   │ │ Manager      │    │    │
 │  │  └──────────┘ └──────────┘ └──────────────┘    │    │
-│  │  ┌──────────┐ ┌──────────────┐                  │    │
-│  │  │ Feedback │ │ Lifecycle    │                  │    │
-│  │  │ Collector│ │ Manager      │                  │    │
-│  │  └──────────┘ └──────────────┘                  │    │
 │  └─────────────────────┬───────────────────────────┘    │
 │                        ▼                                 │
 │  ┌──────────────────────────────────────────────────┐   │
@@ -61,12 +57,9 @@
 │ │ table_rels.. │ └─────────────┘ │  │              │
 │ │ query_templ..│                  │  │              │
 │ │ skill_vers.. │ PG 原生能力：    │  │              │
-│ │ access_pol.. │ LISTEN/NOTIFY   │  │              │
-│ │ audit_log    │ RLS (租户隔离)   │  │              │
+│ │ teams        │ LISTEN/NOTIFY   │  │              │
 │ │ team_member..│ ACID 事务        │  │              │
-│ │ lifecycle_.. │ 递归 CTE (血缘)  │  │              │
-│ │ context_fb.. │                  │  │              │
-│ └──────────────┘                  │  │              │
+│ └──────────────┘ 递归 CTE (血缘)  │  │              │
 └──────────────────────────────────┘  └──────────────┘
 ```
 
@@ -132,11 +125,11 @@ ContextHub 不管理对话历史压缩。compact 方法内部尝试动态 import
 | Retrieval Engine | pgvector 检索 L0 → PG 读 L1 精排 → 按需加载 L2 | `contexts`（含 pgvector 索引） |
 | Indexer | 内容变更时异步生成 L0/L1、更新 pgvector embedding | `contexts` |
 | Propagation Engine | 监听 NOTIFY → 查依赖方 → 执行规则 | `change_events`, `dependencies` |
-| Auth & ACL | 认证、RBAC、资源级权限、字段脱敏 | `access_policies`, `team_memberships` |
-| Audit Logger | 操作审计、上下文溯源 | `audit_log` |
+| Auth & ACL | 认证、RBAC、资源级权限、字段脱敏（post-MVP：ACL deny-override） | `access_policies`, `team_memberships` |
+| Audit Logger | 操作审计、上下文溯源（post-MVP） | `audit_log` |
 | Version Manager | Skill 版本管理 | `skill_versions` |
-| Feedback Collector | 隐式反馈采集、质量评分计算 | `context_feedback`, `contexts` |
-| Lifecycle Manager | 状态机、定期归档/清理、湖表同步删除 | `contexts`, `lifecycle_policies` |
+| Feedback Collector（post-MVP） | 隐式反馈采集、质量评分计算 | `context_feedback`, `contexts` |
+| Lifecycle Manager（post-MVP） | 状态机、定期归档/清理、湖表同步删除 | `contexts`, `lifecycle_policies` |
 | ContextStore | URI 路由层：ctx:// → PG 读写 + ACL 检查 | 所有表 |
 | CatalogConnector | 数据目录抽象（Hive/Iceberg/Delta/Mock） | `table_metadata`, `lineage` |
 
@@ -150,13 +143,12 @@ Agent 写入 ctx://agent/bot/memories/cases/sql-001
     ▼
 ContextStore.write()
     │
-    ├─ 1. ACL 检查（查 access_policies 表）
+    ├─ 1. 身份验证（agent_id 级隔离）
     │
     ├─ 2. PG 事务 {
     │      INSERT/UPDATE contexts 表
     │      INSERT dependencies 表（自动注册依赖）
     │      INSERT change_events 表
-    │      INSERT audit_log 表
     │  }
     │
     ├─ 3. PG NOTIFY 'context_changed'
@@ -199,11 +191,11 @@ PG NOTIFY 'context_changed'
     ▼
 Propagation Engine 被唤醒
     │
-    ├─ SELECT FROM dependencies WHERE target_uri = 'ctx://datalake/.../orders'
+    ├─ SELECT FROM dependencies WHERE dependency_id = ...
     │
     ├─ 对每个依赖方执行 PropagationRule
     │     └─ TableSchemaRule → auto_update（重新生成 L0/L1）
     │     └─ SkillVersionRule → mark_stale（如果是 breaking）
     │
-    └─ UPDATE contexts SET status = 'stale' WHERE uri IN (...)
+    └─ UPDATE contexts SET status = 'stale' WHERE id IN (...)
 ```

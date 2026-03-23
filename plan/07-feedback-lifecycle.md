@@ -26,19 +26,24 @@ class ContextFeedback:
 # - irrelevant: Agent 显式跳过
 ```
 
+> **观测通道说明**：判断 `adopted` vs `ignored` 需要知道 Agent 的生成输出。ContextHub 作为后端中间件无法直接获取 Agent 输出。
+> - **MVP 阶段**：仅支持显式反馈——Agent 通过 `contexthub_feedback` tool 主动报告 adopted/ignored。
+> - **后续增强**：通过 OpenClaw 插件的 `afterTurn` 方法，将 Agent 输出摘要 + 本轮检索的 context URI 列表一起发送给 ContextHub feedback API，由服务端做文本相似度对比推断 adopted/ignored。
+> - **遗留问题**：OpenClaw `afterTurn` 是否能获取 Agent 完整输出？实现时需调研确认。
+
 反馈记录存入 PG：
 
 ```sql
 CREATE TABLE context_feedback (
     id              BIGSERIAL PRIMARY KEY,
-    context_uri     TEXT NOT NULL REFERENCES contexts(uri),
+    context_id      UUID NOT NULL REFERENCES contexts(id),
     session_id      TEXT NOT NULL,
     retrieved_at    TIMESTAMPTZ DEFAULT NOW(),
     outcome         TEXT NOT NULL,          -- 'adopted' | 'ignored' | 'corrected' | 'irrelevant'
     metadata        JSONB
 );
 
-CREATE INDEX idx_feedback_uri ON context_feedback (context_uri);
+CREATE INDEX idx_feedback_context ON context_feedback (context_id);
 ```
 
 ### (2) 反馈信号回写
@@ -47,9 +52,9 @@ CREATE INDEX idx_feedback_uri ON context_feedback (context_uri);
 
 ```sql
 -- 反馈为 adopted 时
-UPDATE contexts SET adopted_count = adopted_count + 1 WHERE uri = $1;
+UPDATE contexts SET adopted_count = adopted_count + 1 WHERE id = $1;
 -- 反馈为 ignored 时
-UPDATE contexts SET ignored_count = ignored_count + 1 WHERE uri = $1;
+UPDATE contexts SET ignored_count = ignored_count + 1 WHERE id = $1;
 ```
 
 综合评分计算：
@@ -71,7 +76,7 @@ UPDATE contexts SET ignored_count = ignored_count + 1 WHERE uri = $1;
 
 ```sql
 -- 高检索 + 低采纳的上下文（噪音候选）
-SELECT uri, active_count, adopted_count, ignored_count,
+SELECT id, uri, active_count, adopted_count, ignored_count,
        adopted_count::float / NULLIF(adopted_count + ignored_count, 0) AS adoption_rate
 FROM contexts
 WHERE active_count > 10
@@ -105,10 +110,10 @@ ORDER BY active_count DESC;
 ```
 
 状态转换通过 PG 操作实现：
-- `active → stale`：`UPDATE contexts SET status = 'stale'`（变更传播触发，或定时任务检测未访问）
-- `stale → active`：`UPDATE contexts SET status = 'active', last_accessed_at = NOW()`（被直接访问时自动恢复）
-- `stale → archived`：清除 `l0_embedding` 列 + `UPDATE contexts SET status = 'archived'`
-- `archived → active`：重新生成 embedding 回填 `l0_embedding` + `UPDATE contexts SET status = 'active'`
+- `active → stale`：`UPDATE contexts SET status = 'stale'`（批量/定时任务按策略更新）；单条传播或按主键更新时用 `UPDATE contexts SET status = 'stale' WHERE id = $1`（亦可用 `WHERE uri = $1`，URI 仍唯一）
+- `stale → active`：`UPDATE contexts SET status = 'active', last_accessed_at = NOW() WHERE id = $1`（或 `WHERE uri = $1`）
+- `stale → archived`：清除 `l0_embedding` 列 + `UPDATE contexts SET status = 'archived' WHERE id = $1`（或 `WHERE uri = $1`）
+- `archived → active`：重新生成 embedding 回填 `l0_embedding` + `UPDATE contexts SET status = 'active' WHERE id = $1`（或 `WHERE uri = $1`）
 
 ### 生命周期策略配置
 
@@ -157,14 +162,15 @@ WHERE c.context_type = lp.context_type AND c.scope = lp.scope
 
 ```python
 async def handle_table_deleted(self, table_uri: str):
+    context_id = await self.pg.fetchval("SELECT id FROM contexts WHERE uri = $1", table_uri)
     async with self.pg.transaction():
-        # 1. 归档该表的 context
+        # 1. 归档该表的 context（目录侧按 URI 定位）
         await self.pg.execute("UPDATE contexts SET status = 'archived' WHERE uri = $1", table_uri)
         # 2. 发出变更事件
         await self.pg.execute("""
-            INSERT INTO change_events (source_uri, change_type, actor)
+            INSERT INTO change_events (context_id, change_type, actor)
             VALUES ($1, 'deleted', 'catalog_sync')
-        """, table_uri)
+        """, context_id)
     # 3. 传播引擎处理：标记依赖此表的 cases/patterns 为 stale
-    await self.pg.execute("NOTIFY context_changed, $1", table_uri)
+    await self.pg.execute("NOTIFY context_changed, $1", context_id)
 ```

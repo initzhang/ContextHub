@@ -9,7 +9,7 @@
 | 上级团队 | `ctx://team/engineering/` | 工程部所有成员 | 工程部管理员 |
 | 根团队(=全组织) | `ctx://team/` | 所有 Agent | 组织管理员 |
 
-团队结构存储在 PG `team_memberships` 表中（定义见 01-storage-paradigm.md），通过 `owner_space` 前缀匹配实现层级继承。
+团队结构存储在 PG `teams` + `team_memberships` 表中（定义见 01-storage-paradigm.md），通过 `teams.parent_id` 递归 CTE 实现层级继承。
 
 ## (b) Skill 版本管理（简化方案）
 
@@ -19,7 +19,7 @@ Skill 本质是自然语言指令（Markdown），不是代码 API。SemVer 的"
 
 ```sql
 CREATE TABLE skill_versions (
-    skill_uri       TEXT NOT NULL,          -- ctx://team/skills/sql-generator
+    skill_id        UUID NOT NULL REFERENCES contexts(id),  -- Skill 对应 contexts 行
     version         INT NOT NULL,           -- 递增版本号
     content         TEXT NOT NULL,          -- Skill 定义（Markdown）
     changelog       TEXT,                   -- 变更说明（~50 tokens）
@@ -27,49 +27,49 @@ CREATE TABLE skill_versions (
     status          TEXT DEFAULT 'draft',   -- 'draft' | 'published' | 'deprecated'
     published_by    TEXT,                   -- 发布者 agent_id
     published_at    TIMESTAMPTZ,
-    PRIMARY KEY (skill_uri, version)
+    PRIMARY KEY (skill_id, version)
 );
 
 -- skill_subscriptions 已合并到 dependencies 表（见 01-storage-paradigm.md）
 -- 订阅通过 dep_type='skill_subscription' 表示：
---   source_uri = 'ctx://agent/{agent_id}'（订阅者）
---   target_uri = skill_uri
+--   dependent_id = <agent context UUID>（订阅者）
+--   dependency_id = skill_id（被订阅的 Skill）
 --   pinned_version = NULL（跟随 latest）或具体版本号
 ```
 
 ### 发布流程
 
 ```python
-async def publish_skill_version(self, skill_uri: str, content: str,
+async def publish_skill_version(self, skill_id: UUID, content: str,
                                  changelog: str, is_breaking: bool, ctx: RequestContext):
     async with self.pg.transaction():
         # 1. 获取当前最大版本号
         max_ver = await self.pg.fetchval(
-            "SELECT COALESCE(MAX(version), 0) FROM skill_versions WHERE skill_uri = $1", skill_uri)
+            "SELECT COALESCE(MAX(version), 0) FROM skill_versions WHERE skill_id = $1", skill_id)
         new_ver = max_ver + 1
 
         # 2. 插入新版本
         await self.pg.execute("""
-            INSERT INTO skill_versions (skill_uri, version, content, changelog, is_breaking, status, published_by, published_at)
+            INSERT INTO skill_versions (skill_id, version, content, changelog, is_breaking, status, published_by, published_at)
             VALUES ($1, $2, $3, $4, $5, 'published', $6, NOW())
-        """, skill_uri, new_ver, content, changelog, is_breaking, ctx.agent_id)
+        """, skill_id, new_ver, content, changelog, is_breaking, ctx.agent_id)
 
         # 3. 更新 contexts 表的 L0/L1（当前版本内容）
         await self.pg.execute("""
             UPDATE contexts SET l0_content = $1, l1_content = $2, l2_content = $3,
                 version = $4, updated_at = NOW()
-            WHERE uri = $5
-        """, generate_l0(content), generate_l1(content), content, new_ver, skill_uri)
+            WHERE id = $5
+        """, generate_l0(content), generate_l1(content), content, new_ver, skill_id)
 
         # 4. 发出变更事件（同一事务内）
         await self.pg.execute("""
-            INSERT INTO change_events (source_uri, change_type, actor, new_version, metadata)
+            INSERT INTO change_events (context_id, change_type, actor, new_version, metadata)
             VALUES ($1, 'version_published', $2, $3, $4)
-        """, skill_uri, ctx.agent_id, str(new_ver),
+        """, skill_id, ctx.agent_id, str(new_ver),
              json.dumps({"is_breaking": is_breaking, "changelog": changelog}))
 
-    # 5. 事务提交后触发传播
-    await self.pg.execute("NOTIFY context_changed, $1", skill_uri)
+    # 5. 事务提交后触发传播（payload 为 Skill 的 context UUID）
+    await self.pg.execute("NOTIFY context_changed, $1", str(skill_id))
 ```
 
 传播逻辑：
@@ -104,26 +104,27 @@ async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestCo
         # 2. 构造目标 URI
         target_uri = f"ctx://team/{target_team}/memories/shared_knowledge/{source['uri'].split('/')[-1]}"
 
-        # 3. 写入目标团队路径
+        # 3. 写入目标团队路径，取得新行 id
         initial_status = 'active' if skip_review else 'pending_review'
-        await self.pg.execute("""
+        promoted_id = await self.pg.fetchval("""
             INSERT INTO contexts (uri, context_type, scope, owner_space, account_id,
                 l0_content, l1_content, l2_content, status)
             VALUES ($1, 'memory', 'team', $2, $3, $4, $5, $6, $7)
+            RETURNING id
         """, target_uri, target_team, ctx.account_id,
              source['l0_content'], source['l1_content'], source['l2_content'], initial_status)
 
-        # 4. 注册 derived_from 依赖（追踪来源）
+        # 4. 注册 derived_from：提升后的记忆（dependent）依赖原始记忆（dependency），便于来源追踪与变更传播
         await self.pg.execute("""
-            INSERT INTO dependencies (source_uri, target_uri, dep_type)
+            INSERT INTO dependencies (dependent_id, dependency_id, dep_type)
             VALUES ($1, $2, 'derived_from')
-        """, target_uri, source_uri)
+        """, promoted_id, source['id'])
 
         # 5. 发出变更事件
         await self.pg.execute("""
-            INSERT INTO change_events (source_uri, change_type, actor, metadata)
+            INSERT INTO change_events (context_id, change_type, actor, metadata)
             VALUES ($1, 'created', $2, $3)
-        """, target_uri, ctx.agent_id,
+        """, promoted_id, ctx.agent_id,
              json.dumps({"promoted_from": source_uri, "review_status": initial_status}))
 
         # 6. 审计日志
@@ -143,13 +144,17 @@ async def approve_promotion(self, uri: str, ctx: RequestContext):
             INSERT INTO audit_log (actor, action, resource_uri, metadata)
             VALUES ($1, 'approve_promotion', $2, '{}')
         """, ctx.agent_id, uri)
-    await self.pg.execute("NOTIFY context_changed, $1", uri)
+    ctx_id = await self.pg.fetchval("SELECT id FROM contexts WHERE uri = $1", uri)
+    await self.pg.execute("NOTIFY context_changed, $1", str(ctx_id))
 
 async def reject_promotion(self, uri: str, reason: str, ctx: RequestContext):
     """审核拒绝：删除 pending_review 状态的记忆。预留接口，MVP 阶段不调用。"""
     async with self.pg.transaction():
+        rejected_id = await self.pg.fetchval(
+            "SELECT id FROM contexts WHERE uri = $1 AND status = 'pending_review'", uri)
+        if rejected_id:
+            await self.pg.execute("DELETE FROM dependencies WHERE dependent_id = $1", rejected_id)
         await self.pg.execute("DELETE FROM contexts WHERE uri = $1 AND status = 'pending_review'", uri)
-        await self.pg.execute("DELETE FROM dependencies WHERE source_uri = $1", uri)
         await self.pg.execute("""
             INSERT INTO audit_log (actor, action, resource_uri, metadata)
             VALUES ($1, 'reject_promotion', $2, $3)

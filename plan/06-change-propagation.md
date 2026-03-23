@@ -34,13 +34,13 @@
 ```python
 # 任何产生变更的操作都在事务中同时写入 change_event
 async with self.pg.transaction():
-    await self.update_context(uri, new_content)
+    await self.update_context(context_id, new_content)
     await self.pg.execute("""
-        INSERT INTO change_events (source_uri, change_type, actor, diff_summary, new_version, metadata)
+        INSERT INTO change_events (context_id, change_type, actor, diff_summary, new_version, metadata)
         VALUES ($1, $2, $3, $4, $5, $6)
-    """, uri, change_type, actor, diff_summary, new_version, metadata)
-# 事务提交后通知传播引擎
-await self.pg.execute("NOTIFY context_changed, $1", uri)
+    """, context_id, change_type, actor, diff_summary, new_version, metadata)
+# 事务提交后通知传播引擎（NOTIFY payload 为该上下文的 UUID 字符串）
+await self.pg.execute("NOTIFY context_changed, $1", context_id)
 ```
 
 ## (2) 依赖关系注册
@@ -48,12 +48,14 @@ await self.pg.execute("NOTIFY context_changed, $1", uri)
 依赖存储在 PG `dependencies` 表中（替代 `.deps.json` 文件）：
 
 ```sql
--- 示例：Agent 的一个 SQL case 依赖某个 Skill 和某张表
-INSERT INTO dependencies (source_uri, target_uri, dep_type, pinned_version) VALUES
-  ('ctx://agent/query-bot/memories/cases/sql-pattern-001',
-   'ctx://team/skills/sql-generator', 'skill_version', '2'),
-  ('ctx://agent/query-bot/memories/cases/sql-pattern-001',
-   'ctx://datalake/prod/orders', 'table_schema', NULL);
+-- 示例：Agent 的一个 SQL case 依赖某个 Skill 和某张表（两列均为上下文的 UUID）
+INSERT INTO dependencies (dependent_id, dependency_id, dep_type, pinned_version) VALUES
+  ('a1b2c3d4-e5f6-4789-a012-3456789abcde',  -- UUID of ctx://agent/query-bot/memories/cases/sql-pattern-001
+   'b2c3d4e5-f6a7-4890-b123-456789abcdef',  -- UUID of ctx://team/skills/sql-generator
+   'skill_version', '2'),
+  ('a1b2c3d4-e5f6-4789-a012-3456789abcde',  -- 同上 dependent（case）
+   'c3d4e5f6-a7b8-4901-c234-567890abcdef',  -- UUID of ctx://datalake/prod/orders
+   'table_schema', NULL);
 ```
 
 依赖类型：
@@ -62,8 +64,8 @@ INSERT INTO dependencies (source_uri, target_uri, dep_type, pinned_version) VALU
 - `derived_from`：从某个共享 memory 派生
 
 依赖何时注册：
-- Agent 创建 case/pattern 时，自动记录当时使用了哪些 Skill 和表 → 写入 `dependencies` 表
-- 记忆提升（promote）时，在目标记忆中记录 `derived_from` 源
+- Agent 创建 case/pattern 时，自动记录当时使用了哪些 Skill 和表 → 写入 `dependencies` 表（`dependent_id` = 该 case 的 `contexts.id`，`dependency_id` = 被引用 Skill/表 的 `contexts.id`）
+- 记忆提升（promote）时，在目标记忆中记录 `derived_from` 源（`dependency_id` 指向源 memory）
 - 写入时的附加操作，不需要额外的模型调用
 
 ## (3) 变更传播流程
@@ -75,11 +77,11 @@ INSERT INTO dependencies (source_uri, target_uri, dep_type, pinned_version) VALU
 change_events 表写入（同一事务，ACID 保证）
     │
     ▼
-PG NOTIFY 'context_changed' → 传播引擎被唤醒
+PG NOTIFY 'context_changed'（payload = 变动上下文的 UUID）→ 传播引擎被唤醒
     │
     ▼
-传播引擎查询：谁依赖了这个 URI？
-    │  方法：SELECT * FROM dependencies WHERE target_uri = $1（精确匹配，有索引，极快）
+传播引擎查询：谁依赖了这个上下文？
+    │  方法：SELECT * FROM dependencies WHERE dependency_id = $1（精确匹配，有索引，极快）
     │
     ▼
 对每个依赖方，根据 dep_type 执行对应的 PropagationRule
@@ -91,7 +93,7 @@ PG NOTIFY 'context_changed' → 传播引擎被唤醒
 
 ```python
 class PropagationRule(ABC):
-    async def evaluate(self, event: ChangeEvent, dependent_uri: str) -> PropagationAction
+    async def evaluate(self, event: ChangeEvent, dependent_id: str) -> PropagationAction
 
 class PropagationAction:
     action: str          # mark_stale | auto_update | notify | no_action
@@ -103,7 +105,7 @@ class PropagationAction:
 
 ```python
 class SkillVersionRule(PropagationRule):
-    async def evaluate(self, event, dependent_uri):
+    async def evaluate(self, event, dependent_id):
         if event.metadata.get("is_breaking"):
             return PropagationAction(action="mark_stale",
                 reason=f"依赖的 Skill {event.source_uri} 发布了破坏性变更 v{event.new_version}")
@@ -112,17 +114,17 @@ class SkillVersionRule(PropagationRule):
                 reason=f"Skill 更新到 v{event.new_version}，非破坏性变更")
 
 class TableSchemaRule(PropagationRule):
-    async def evaluate(self, event, dependent_uri):
+    async def evaluate(self, event, dependent_id):
         return PropagationAction(action="auto_update",
             reason=f"表 {event.source_uri} schema 已变更",
-            auto_update_fn=lambda: regenerate_l0_l1(dependent_uri))
+            auto_update_fn=lambda: regenerate_l0_l1(dependent_id))
 ```
 
 `mark_stale` 实现（PG 原子操作）：
 ```sql
-UPDATE contexts SET status = 'stale', updated_at = NOW() WHERE uri = $1;
+UPDATE contexts SET status = 'stale', updated_at = NOW() WHERE id = $1;
 -- 同时记录 stale 原因到 change_events
-INSERT INTO change_events (source_uri, change_type, actor, diff_summary)
+INSERT INTO change_events (context_id, change_type, actor, diff_summary)
 VALUES ($1, 'marked_stale', 'propagation_engine',
         '依赖的 Skill sql-generator 已从 v1 升级到 v2 (breaking)');
 ```
@@ -131,13 +133,13 @@ VALUES ($1, 'marked_stale', 'propagation_engine',
 
 ```python
 class DerivedMemoryRule(PropagationRule):
-    async def evaluate(self, event, dependent_uri):
+    async def evaluate(self, event, dependent_id):
         if event.change_type == "modified":
             old_text = extract_changed_text(event)
             new_text = extract_new_text(event)
-            if old_text and can_simple_replace(dependent_uri, old_text):
+            if old_text and can_simple_replace(dependent_id, old_text):
                 return PropagationAction(action="auto_update",
-                    auto_update_fn=lambda: simple_text_replace(dependent_uri, old_text, new_text))
+                    auto_update_fn=lambda: simple_text_replace(dependent_id, old_text, new_text))
             else:
                 return PropagationAction(action="notify", reason="源 memory 已修改，请人工确认")
 ```
@@ -146,9 +148,9 @@ class DerivedMemoryRule(PropagationRule):
 
 ```python
 class ComplexPropagationRule(PropagationRule):
-    async def evaluate(self, event, dependent_uri):
+    async def evaluate(self, event, dependent_id):
         # 从 PG 读取依赖方的 L0 摘要
-        l0 = await self.pg.fetchval("SELECT l0_content FROM contexts WHERE uri = $1", dependent_uri)
+        l0 = await self.pg.fetchval("SELECT l0_content FROM contexts WHERE id = $1", dependent_id)
         prompt = f"""
         变动：{event.diff_summary}
         受影响的上下文摘要：{l0}
@@ -167,23 +169,23 @@ class ComplexPropagationRule(PropagationRule):
 
 1. Skill Service 发布新版本（事务内）
    → INSERT INTO skill_versions (...)
-   → UPDATE contexts SET version = 3 WHERE uri = 'ctx://team/skills/sql-generator'
-   → INSERT INTO change_events (source_uri='ctx://team/skills/sql-generator',
+   → UPDATE contexts SET version = 3 WHERE id = '<uuid-of-sql-generator-skill>'
+   → INSERT INTO change_events (context_id='<uuid-of-sql-generator-skill>',
        change_type='version_published', new_version='3',
        metadata='{"is_breaking": true}',
        diff_summary='新增 window function 支持，废弃子查询替代方案')
    → COMMIT
 
-2. PG NOTIFY 'context_changed' → 传播引擎被唤醒
+2. PG NOTIFY 'context_changed'（payload = 该 Skill 上下文的 UUID）→ 传播引擎被唤醒
 
 3. 传播引擎查询依赖方
-   → SELECT source_uri FROM dependencies
-     WHERE target_uri = 'ctx://team/skills/sql-generator'
+   → SELECT dependent_id FROM dependencies
+     WHERE dependency_id = '<uuid-of-sql-generator-skill>'
    → 找到 3 个 cases
 
 4. 对每个依赖方执行 SkillVersionRule
    → is_breaking=True → action="mark_stale"
-   → UPDATE contexts SET status = 'stale' WHERE uri IN (case1, case2, case3)
+   → UPDATE contexts SET status = 'stale' WHERE id IN (case1_uuid, case2_uuid, case3_uuid)
 
 5. 通知相关 Agent
    → 查询 cases 的 owner_space → 找到对应 agent_id
@@ -210,34 +212,35 @@ class PropagationEngine:
         async for notification in self.pg.notifications():
             await self.process_event(notification.payload)
 
-    async def process_event(self, source_uri: str):
-        # 1. 读取该 URI 的所有未处理事件（不是只取最新一条）
+    async def process_event(self, context_id: str):
+        # context_id：来自 NOTIFY payload 的上下文 UUID 字符串
+        # 1. 读取该上下文的所有未处理事件（不是只取最新一条）
         #    按时间正序处理，确保不遗漏中间事件
         #    注：多实例部署时应改为 SELECT ... FOR UPDATE SKIP LOCKED 防止竞争
         events = await self.pg.fetch("""
             SELECT * FROM change_events
-            WHERE source_uri = $1 AND NOT processed
+            WHERE context_id = $1 AND NOT processed
             ORDER BY timestamp ASC
-        """, source_uri)
+        """, context_id)
         if not events:
             return
 
         # 2. 查询所有依赖方（一次查询，所有事件共用）
         dependents = await self.pg.fetch("""
-            SELECT source_uri, dep_type, pinned_version
-            FROM dependencies WHERE target_uri = $1
-        """, source_uri)
+            SELECT dependent_id, dep_type, pinned_version
+            FROM dependencies WHERE dependency_id = $1
+        """, context_id)
 
         # 3. 对每个事件 × 每个依赖方执行对应规则
         for event in events:
             for dep in dependents:
                 try:
                     rule = self.get_rule(dep['dep_type'])
-                    action = await rule.evaluate(event, dep['source_uri'])
-                    await self.execute_action(action, dep['source_uri'])
+                    action = await rule.evaluate(event, dep['dependent_id'])
+                    await self.execute_action(action, dep['dependent_id'])
                 except Exception as e:
                     # 单个依赖方处理失败不影响其他依赖方和后续事件
-                    logger.error(f"Propagation failed for {dep['source_uri']}: {e}")
+                    logger.error(f"Propagation failed for {dep['dependent_id']}: {e}")
                     # 失败事件不标记 processed，下次启动时重试
                     continue
 
@@ -270,12 +273,13 @@ class DependencyIntegrityChecker:
     async def check(self) -> list[IntegrityIssue]:
         issues = []
         # 从 PG 批量读取所有上下文内容
-        contexts = await self.pg.fetch("SELECT uri, l0_content, l1_content, l2_content FROM contexts WHERE status = 'active'")
+        contexts = await self.pg.fetch("SELECT id, uri, l0_content, l1_content, l2_content FROM contexts WHERE status = 'active'")
         for ctx in contexts:
+            # 实现上需将正文中的 URI 引用解析为 contexts.id，再与 dependency_id 比较
             actual_refs = extract_uri_references(ctx['l1_content'], ctx['l2_content'])
             declared_deps = await self.pg.fetch(
-                "SELECT target_uri FROM dependencies WHERE source_uri = $1", ctx['uri'])
-            declared_set = {d['target_uri'] for d in declared_deps}
+                "SELECT dependency_id FROM dependencies WHERE dependent_id = $1", ctx['id'])
+            declared_set = {d['dependency_id'] for d in declared_deps}
             undeclared = actual_refs - declared_set
             if undeclared:
                 issues.append(IntegrityIssue(
