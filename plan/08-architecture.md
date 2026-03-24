@@ -2,79 +2,85 @@
 
 ## 架构图
 
-```
-┌─────────────────────────────────────────────────────────┐
-│              OpenClaw（单实例，多 Agent 身份）              │
-│                                                          │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐      │
-│  │ 数据查询  │  │ 数据分析  │  │ 其他业务 Agent   │      │
-│  │ agent_id │  │ agent_id │  │ agent_id         │      │
-│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘      │
-│       └──────────────┼────────────────┘                 │
-│                      ▼                                   │
-│         ContextHub OpenClaw Plugin                       │
-│   （注册 tools + lifecycle hooks，调用 SDK）              │
-│                      ▼                                   │
-│              ContextHub Python SDK                       │
-│          （ctx:// URI + 文件语义接口）                     │
-└──────────────────────┬──────────────────────────────────┘
+```text
+┌──────────────────────────────────────────────────────────────┐
+│                 OpenClaw（单实例，多 Agent 身份）              │
+│                                                              │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐           │
+│  │ 查询 Agent│  │ 分析 Agent│  │ 其他业务 Agent   │           │
+│  │ agent_id │  │ agent_id │  │ agent_id         │           │
+│  └────┬─────┘  └────┬─────┘  └────────┬─────────┘           │
+│       └──────────────┼────────────────┘                      │
+│                      ▼                                        │
+│            ContextHub OpenClaw Plugin                         │
+│      （注册 tools + lifecycle hooks，调用 SDK）               │
+│                      ▼                                        │
+│               ContextHub Python SDK                           │
+│          （ctx:// URI + typed HTTP client）                   │
+└──────────────────────┬───────────────────────────────────────┘
                        ▼
-┌──────────────────────────────────────────────────────────┐
-│                  ContextHub Server (FastAPI)              │
-│                                                          │
-│  ┌────────────┐  ┌────────────┐  ┌────────────────┐     │
-│  │ Context    │  │ Memory     │  │ Skill          │     │
-│  │ Service    │  │ Service    │  │ Service         │     │
-│  └─────┬──────┘  └─────┬──────┘  └──────┬─────────┘     │
-│        │               │                │               │
-│  ┌─────┴───────────────┴────────────────┴──────────┐    │
-│  │              Core Engine                         │    │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────────┐    │    │
-│  │  │ Retrieval│ │ Indexer  │ │ Propagation  │    │    │
-│  │  │ Engine   │ │          │ │ Engine       │    │    │
-│  │  └──────────┘ └──────────┘ └──────────────┘    │    │
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────────┐    │    │
-│  │  │ Auth &   │ │ Audit    │ │ Version      │    │    │
-│  │  │ ACL      │ │ Logger   │ │ Manager      │    │    │
-│  │  └──────────┘ └──────────┘ └──────────────┘    │    │
-│  └─────────────────────┬───────────────────────────┘    │
-│                        ▼                                 │
-│  ┌──────────────────────────────────────────────────┐   │
-│  │           ContextStore（URI 路由层）               │   │
-│  │   ctx:// URI → PG 读写 + 向量检索 + ACL 检查     │   │
-│  └──────────────────────┬────────────────────────────┘   │
-└──────────────────────────┼───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│               ContextHub Server (FastAPI)                     │
+│                                                              │
+│  routers + RequestContext + request-scoped ScopedRepo        │
+│                                                              │
+│  ┌────────────┐  ┌────────────┐  ┌────────────────┐         │
+│  │ Context    │  │ Memory     │  │ Skill          │         │
+│  │ Service    │  │ Service    │  │ Service         │         │
+│  └─────┬──────┘  └─────┬──────┘  └──────┬─────────┘         │
+│        │               │                │                    │
+│  ┌─────┴───────────────┴────────────────┴──────────┐        │
+│  │              Core Engine                         │        │
+│  │  ┌────────────┐ ┌───────────┐ ┌──────────────┐  │        │
+│  │  │ Retrieval  │ │ Indexer   │ │ Propagation  │  │        │
+│  │  │ Service    │ │ Service   │ │ Engine       │  │        │
+│  │  └────────────┘ └───────────┘ └──────────────┘  │        │
+│  │  ┌────────────┐                                  │        │
+│  │  │ ACL        │  Post-MVP Reserved:              │        │
+│  │  │ Service    │  Audit / Feedback / Lifecycle    │        │
+│  │  └────────────┘  (见 14-adr-backlog-register.md) │        │
+│  └─────────────────────┬───────────────────────────┘        │
+│                        ▼                                     │
+│  ┌──────────────────────────────────────────────────┐       │
+│  │         ContextStore（URI 路由层）                 │       │
+│  │       ctx:// URI → read / write / ls / stat      │       │
+│  └──────────────────────┬───────────────────────────┘       │
+└──────────────────────────┼───────────────────────────────────┘
                            ▼
-┌──────────────────────────────────┐  ┌──────────────┐
-│   PostgreSQL + pgvector          │  │ Catalog      │
-│                                  │  │ Connector    │
-│ ┌──────────────┐ ┌─────────────┐ │  │              │
-│ │ contexts     │ │ pgvector    │ │  │ Hive/Iceberg/│
-│ │ dependencies │ │             │ │  │ Delta/Mock   │
-│ │ change_events│ │ L0 embedding│ │  │              │
-│ │ table_meta.. │ │ HNSW 索引   │ │  │              │
-│ │ lineage      │ │             │ │  │              │
-│ │ table_rels.. │ └─────────────┘ │  │              │
-│ │ query_templ..│                  │  │              │
-│ │ skill_vers.. │ PG 原生能力：    │  │              │
-│ │ teams        │ LISTEN/NOTIFY   │  │              │
-│ │ team_member..│ ACID 事务        │  │              │
-│ └──────────────┘ 递归 CTE (血缘)  │  │              │
-└──────────────────────────────────┘  └──────────────┘
+┌────────────────────────────────────┐   ┌─────────────────────┐
+│ PostgreSQL + pgvector              │   │ CatalogConnector    │
+│                                    │   │ (carrier-specific)  │
+│ ┌──────────────┐ ┌───────────────┐ │   │                     │
+│ │ contexts     │ │ pgvector      │ │   │ Hive/Iceberg/Mock   │
+│ │ dependencies │ │               │ │   │                     │
+│ │ change_events│ │ L0 embedding  │ │   │                     │
+│ │ skill_version│ │ HNSW 索引     │ │   │                     │
+│ │ skill_subscr.│ │               │ │   │                     │
+│ │ teams        │ └───────────────┘ │   │                     │
+│ │ team_members │                   │   │                     │
+│ └──────────────┘                   │   │                     │
+│                                    │   │                     │
+│ PG 原生能力：                       │   │                     │
+│ RLS / ACID / CTE / LISTEN/NOTIFY  │   │                     │
+└────────────────────────────────────┘   └─────────────────────┘
 ```
 
-## 与原方案的关键区别
+## 关键架构约束
 
-| 维度 | 原方案（三层存储抽象） | 新方案（PG 中心） |
-|------|----------------------|-------------------|
-| 内容存储 | ContentStore 接口（S3/LocalFS） | PG TEXT 列（TOAST 自动处理） |
-| 元数据存储 | 文件名/路径/向量 DB 标量字段 | PG 结构化表 |
-| 关系存储 | `.relations.json` / `.deps.json` 文件 | PG `dependencies` / `table_relationships` 表 |
-| 事件系统 | append-only JSON / Redis Streams | PG `change_events` 表 + `LISTEN/NOTIFY` |
-| 权限 | 应用层路径前缀检查 | PG RLS + `access_policies` 表 |
-| 审计 | append-only JSON 文件 | PG `audit_log` 表（事务内写入） |
-| 事务保证 | 无（内容和元数据可能不一致） | ACID（内容、元数据、事件在同一事务中） |
-| 向量索引 | 独立向量 DB（Chroma/Milvus），需双写对账 | pgvector 扩展，与元数据同库同事务 |
+- `ContextStore` 只负责 `read/write/ls/stat`，不负责 search。
+- `RetrievalService` 是唯一检索入口，统一承载 API `/search`、tool `grep` 和 carrier-specific `sql-context`。
+- `SkillService` 同时持有 Skill 版本管理和版本解析；不存在独立的 `Version Manager`。
+- `PropagationEngine` 只以 `change_events` 为 source of truth；`NOTIFY` 只是 wake-up hint。
+- `ACLService` 在 MVP 只做默认可见性 / 默认写权限；显式 ACL allow/deny/mask 属于明确后置 backlog，见 `14-adr-backlog-register.md`。
+- 每个请求或后台 work item 都必须显式创建一个 tenant-scoped `ScopedRepo`；middleware 不执行 `SET LOCAL`。
+
+## SDK、API、Plugin 的职责
+
+| 层 | 职责 | 不负责 |
+|----|------|--------|
+| SDK | 把 `ctx.read()`、`ctx.search()`、`ctx.memory.promote()` 等映射到 HTTP API | 不实现服务端语义 |
+| API | 身份解析、协议转换、注入 request-scoped `ScopedRepo` | 不做产品规则判断 |
+| Plugin | 注册 tools、`assemble` 注入 recall、`afterTurn` auto-capture、委托 compaction | 不重复实现 ACL / 版本解析 / 传播 |
 
 ## DataAgent 层说明
 
@@ -117,85 +123,100 @@ ContextHub 不管理对话历史压缩。compact 方法内部尝试动态 import
 
 ## 核心模块职责
 
-| 模块 | 职责 | 依赖的 PG 表 |
-|------|------|-------------|
-| Context Service | 上下文 CRUD、L0/L1/L2 管理 | `contexts` |
-| Memory Service | 记忆提取、去重、热度管理、共享/提升 | `contexts`, `dependencies` |
-| Skill Service | Skill 定义、版本管理、发布/订阅 | `contexts`, `skill_versions`, `dependencies`（dep_type='skill_subscription'） |
-| Retrieval Engine | pgvector 检索 L0 → PG 读 L1 精排 → 按需加载 L2 | `contexts`（含 pgvector 索引） |
-| Indexer | 内容变更时异步生成 L0/L1、更新 pgvector embedding | `contexts` |
-| Propagation Engine | 监听 NOTIFY → 查依赖方 → 执行规则 | `change_events`, `dependencies` |
-| Auth & ACL | 认证、RBAC、资源级权限、字段脱敏（post-MVP：ACL deny-override） | `access_policies`, `team_memberships` |
-| Audit Logger | 操作审计、上下文溯源（post-MVP） | `audit_log` |
-| Version Manager | Skill 版本管理 | `skill_versions` |
-| Feedback Collector（post-MVP） | 隐式反馈采集、质量评分计算 | `context_feedback`, `contexts` |
-| Lifecycle Manager（post-MVP） | 状态机、定期归档/清理、湖表同步删除 | `contexts`, `lifecycle_policies` |
-| ContextStore | URI 路由层：ctx:// → PG 读写 + ACL 检查 | 所有表 |
-| CatalogConnector | 数据目录抽象（Hive/Iceberg/Delta/Mock） | `table_metadata`, `lineage` |
+| 模块 | 职责 | MVP 状态 |
+|------|------|----------|
+| `ContextStore` | URI 路由：`ctx://` -> `read/write/ls/stat` | MVP Core |
+| `RetrievalService` | embedding、pgvector 检索、L1 rerank、结果过滤 | MVP Core |
+| `ContextService` | 通用 CRUD 编排 | MVP Core |
+| `MemoryService` | promote、团队共享、`derived_from` 依赖注册 | MVP Core |
+| `SkillService` | publish / subscribe / `read_resolved` | MVP Core |
+| `PropagationEngine` | outbox drain、retry、requeue stuck events | MVP Core |
+| `ACLService` | 默认可见性 / 默认写权限 | MVP Core |
+| `IndexerService` | L0/L1 生成、embedding 更新 | MVP Core |
+| `CatalogSyncService` | Catalog 同步 | Carrier-Specific |
+| `ReconcilerService` | embedding 补写 / 一致性修复 | Carrier-Specific |
+| 审计、反馈、生命周期 | 独立后置能力 | Post-MVP Reserved |
 
 ## 数据流
 
-### 写入流程
+### 写入 / Promote / Publish
 
-```
-Agent 写入 ctx://agent/bot/memories/cases/sql-001
+```text
+Agent 写入或 promote / publish
     │
     ▼
-ContextStore.write()
+API router 获取 RequestContext + ScopedRepo
     │
-    ├─ 1. 身份验证（agent_id 级隔离）
+    ▼
+ContextService / MemoryService / SkillService
     │
-    ├─ 2. PG 事务 {
+    ├─ 1. ContextStore.write()
+    │
+    ├─ 2. 同一 ScopedRepo 内事务 {
     │      INSERT/UPDATE contexts 表
     │      INSERT dependencies 表（自动注册依赖）
     │      INSERT change_events 表
     │  }
     │
-    ├─ 3. PG NOTIFY 'context_changed'
+    ├─ 3. commit 后 trigger 发出 NOTIFY
     │
-    └─ 4. 异步：Indexer 生成 L0 embedding → 写入 PG pgvector 列
+    └─ 4. 异步补全：
+           IndexerService 生成 L0/L1 embedding → 写入 pgvector
+           PropagationEngine 处理变更传播
 ```
 
-### 检索流程
+### 检索
 
-```
+```text
 Agent 搜索 "月度销售额统计"
     │
     ▼
-ContextStore.search()
+/api/v1/search 或 tool grep
     │
-    ├─ 1. pgvector：L0 embedding 语义匹配 + 标量过滤 → top-K URI
+    ▼
+RetrievalService.search()
     │
-    ├─ 2. PG：批量读取 L1 内容 → Rerank
+    ├─ 1. query embedding 生成
     │
-    ├─ 3. ACL 过滤 + 字段脱敏
+    ├─ 2. pgvector 检索 L0 + 标量过滤 → top-K
     │
-    └─ 4. 返回结果（按需可继续加载 L2）
+    ├─ 3. 读取 L1 内容 → Rerank
+    │
+    ├─ 4. 默认可见性过滤
+    │
+    └─ 5. 返回结果（按需加载 L2 / 结构化补充数据）
 ```
 
-### 变更传播流程
+### 变更传播
 
+```text
+上游变更提交
+    │
+    ▼
+INSERT change_events + NOTIFY context_changed
+    │
+    ▼
+PropagationEngine 被唤醒 / 启动补扫 / 周期补扫
+    │
+    ├─ 用 event.account_id 创建 ScopedRepo
+    │
+    ├─ 查 dependencies / skill_subscriptions
+    │     WHERE target_uri = changed_uri
+    │
+    ├─ 对每个依赖方执行传播规则
+    │     ├─ mark_stale（标记过期）
+    │     ├─ auto_update（重新生成 L0/L1）
+    │     └─ advisory（仅通知，人工决策）
+    │
+    └─ 成功则 processed，失败则 retry（指数退避）
 ```
-CatalogConnector 检测到 orders 表 schema 变更
-    │
-    ▼
-PG 事务 {
-    UPDATE table_metadata SET ddl = ...
-    UPDATE contexts SET version = version + 1
-    INSERT change_events
-}
-    │
-    ▼
-PG NOTIFY 'context_changed'
-    │
-    ▼
-Propagation Engine 被唤醒
-    │
-    ├─ SELECT FROM dependencies WHERE dependency_id = ...
-    │
-    ├─ 对每个依赖方执行 PropagationRule
-    │     └─ TableSchemaRule → auto_update（重新生成 L0/L1）
-    │     └─ SkillVersionRule → mark_stale（如果是 breaking）
-    │
-    └─ UPDATE contexts SET status = 'stale' WHERE id IN (...)
-```
+
+## 与旧方案的关键区别
+
+| 维度 | 旧表述 | 冻结后的实现 |
+|------|--------|--------------|
+| 检索入口 | `ContextStore.search()` | `RetrievalService.search()` |
+| 版本解析 | 独立 Version Manager 或 ContextStore 特判 | `SkillService.read_resolved()` |
+| RLS 绑定 | middleware / 全局 repo 模糊负责 | `PgRepository.session(account_id)` 唯一负责 |
+| MVP 边界 | audit / feedback / lifecycle 混在主图中 | 明确后置，不进初始骨架 |
+| MVP 主线 | 垂直 Text-to-SQL 链路 | 横向协作闭环；Text-to-SQL 仅载体 |

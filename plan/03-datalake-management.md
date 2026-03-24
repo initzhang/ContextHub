@@ -111,8 +111,8 @@ WHERE context_id = $2;
 BEGIN;
   UPDATE table_metadata SET ddl = $1 WHERE context_id = $2;
   UPDATE contexts SET version = version + 1, updated_at = NOW() WHERE id = $2;
-  INSERT INTO change_events (context_id, change_type, actor, diff_summary)
-    VALUES ($2, 'modified', 'catalog_sync', 'schema 变更: 新增字段 discount_rate DECIMAL');
+  INSERT INTO change_events (context_id, account_id, change_type, actor, diff_summary)
+    VALUES ($2, current_setting('app.account_id'), 'modified', 'catalog_sync', 'schema 变更: 新增字段 discount_rate DECIMAL');
 COMMIT;
 -- PG NOTIFY → 传播引擎标记依赖此表的 Skill/cases 为 stale
 ```
@@ -143,7 +143,7 @@ async def sync_table(self, catalog: str, db: str, table: str):
         row = await self.pg.fetchrow("""
             INSERT INTO contexts (uri, context_type, scope, l0_content, l1_content, account_id)
             VALUES ($1, 'table_schema', 'datalake', $2, $3, $4)
-            ON CONFLICT (uri) DO UPDATE SET l1_content = $3, updated_at = NOW()
+            ON CONFLICT (account_id, uri) DO UPDATE SET l1_content = $3, updated_at = NOW()
             RETURNING id
         """, uri, generate_l0(schema), generate_l1(schema), account_id)
         context_id = row["id"]
@@ -158,8 +158,8 @@ async def sync_table(self, catalog: str, db: str, table: str):
         # 3. 如果 DDL 变了，插入变更事件
         if schema_changed:
             await self.pg.execute(
-                "INSERT INTO change_events (context_id, change_type, actor) VALUES ($1, 'modified', 'catalog_sync')",
-                context_id)
+                "INSERT INTO change_events (context_id, account_id, change_type, actor) VALUES ($1, $2, 'modified', 'catalog_sync')",
+                context_id, account_id)
 ```
 
 ## (c) Text-to-SQL 上下文组装

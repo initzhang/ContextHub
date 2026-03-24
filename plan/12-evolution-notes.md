@@ -1,143 +1,98 @@
-# 12 — 架构演进备忘
+# 12 — 保留 ADR（替代架构）
 
-MVP 阶段保持 PG-only 的简洁性，通过接口抽象为以下两个方向预留升级路径。
+本文件只记录 Session 7 保留下来的替代架构 ADR。它们都不是当前排期，不应回写为主线默认方向；保留它们的唯一目的，是说明“为什么现在不做”和“什么条件下重开”。
 
----
-
-## A. 大文本存储：PG → 对象存储
-
-### 现状
-
-MVP 阶段所有内容（L0/L1/L2）存 PG TEXT 列，TOAST 自动处理。数据湖表的 L2 已拆为结构化子表（`table_metadata`、`lineage` 等），单字段不大。
-
-### 何时需要升级
-
-- 出现 MB 级别的长文档（如完整技术文档、大型 DDL）导致 TOAST 读写延迟明显
-- PG VACUUM 因大量 dead tuples（频繁更新大 TEXT 列）产生性能问题
-- 存储成本显著高于对象存储方案
-
-### 预留接口
-
-在 ContextStore 层抽象 L2 内容存储后端：
-
-```python
-class ContentBackend(ABC):
-    """L2 内容存储后端，MVP 用 PG，后续可切换到对象存储"""
-    async def read(self, uri: str) -> str: ...
-    async def write(self, uri: str, content: str) -> None: ...
-
-class PGContentBackend(ContentBackend):
-    """直接读写 contexts.l2_content 列"""
-    ...
-
-class S3ContentBackend(ContentBackend):
-    """PG 存 s3_key 引用，内容存 S3/MinIO
-    注意：跨 PG 和 S3 的写入不在同一个事务中，需要处理不一致（如写 PG 成功但 S3 失败）。
-    可选方案：先写 S3 → 再写 PG（失败时 S3 有孤儿对象但不影响一致性，定期清理即可）。
-    """
-    ...
-```
-
-### 升级时的注意事项
-
-- 事务一致性降级：PG 元数据和 S3 内容不再原子更新，需要补偿机制
-- 读取路径多一跳：PG 查 key → S3 读内容
-- 迁移策略：可按 context_type 逐步迁移（先迁长文档 resources，再迁其他）
+不属于本文件的条目：
+- `MCP Server`：这是明确后置 backlog，不是替代架构，见 `14-adr-backlog-register.md`
+- 长文档高级检索：这是明确后置 backlog，见 `11-long-document-retrieval.md`
 
 ---
 
-## B. 事件传播：LISTEN/NOTIFY → 消息队列
+## ADR-A：PG L2 → 对象存储
 
-### 现状
+### 当前结论
 
-MVP 阶段用 PG LISTEN/NOTIFY 做事件通知，`change_events` 表 + `processed` 字段做 outbox 补偿。
+暂不采纳。
 
-### LISTEN/NOTIFY 的已知限制
+### 当前拒绝原因
 
-- 无持久化：传播引擎断连期间的 NOTIFY 消息丢失（靠 outbox 补偿）
-- payload 限制 8000 bytes（当前只传 URI，够用）
-- 无 ACK / 重试 / 死信队列
-- 单 listener 模式，无法做消费者组负载均衡
+- 当前 MVP 以 PG-only 为最简实现路径，元数据与内容同事务更新，正确性边界清晰。
+- 过早引入对象存储会带来双写、补偿和读路径多一跳的问题，但当前并没有真实证据表明这些复杂度是必要的。
+- 长文档场景已经被定义为 `resource` 子类型的 file-backed 路径，不应再把“长文档存在文件系统”偷换成“通用 L2 都要迁对象存储”。
 
-### 何时需要升级
+### 重开前提
 
-- 传播引擎需要多实例部署（高可用或负载均衡）
-- 事件量大到 outbox 扫描 `WHERE NOT processed` 成为瓶颈
-- 需要事件回放、死信队列等高级特性
+- 出现真实的 MB 级通用 `l2_content`，且 PG TOAST、VACUUM 或存储成本已经成为可观测瓶颈。
+- 这些问题不能通过类型拆分、结构化拆表或长文档 file-backed 路径解决。
 
-### 预留接口
+### 重开时必须重验的假设
 
-传播引擎的事件消费已经是异步迭代器模式，替换时改动很小：
+- 哪些 `context_type` 真的要迁出 PG，哪些继续留在 PG。
+- 内容与元数据不再同事务后的补偿策略是否可接受。
+- 读路径增加一次对象存储访问后，P50/P99 延迟是否仍满足要求。
 
-```python
-class EventConsumer(ABC):
-    """事件消费接口"""
-    async def start(self) -> None: ...
-    async def events(self) -> AsyncIterator[ChangeEvent]: ...
-    async def ack(self, event_id: str) -> None: ...
+### 重开入口
 
-class PGNotifyConsumer(EventConsumer):
-    """MVP：PG LISTEN/NOTIFY + outbox 补偿"""
-    async def start(self):
-        await self.pg.execute("LISTEN context_changed")
+- 主入口：`01-storage-paradigm.md`
+- 如涉及长文档边界：`11-long-document-retrieval.md`
 
-    async def events(self):
-        async for notification in self.pg.notifications():
-            # 从 change_events 表读取完整事件
-            event = await self.pg.fetchrow(
-                "SELECT * FROM change_events WHERE source_uri = $1 AND NOT processed LIMIT 1",
-                notification.payload)
-            if event:
-                yield event
+## ADR-B：LISTEN/NOTIFY → 消息队列
 
-    async def ack(self, event_id: str):
-        await self.pg.execute("UPDATE change_events SET processed = TRUE WHERE event_id = $1", event_id)
+### 当前结论
 
-class RedisStreamConsumer(EventConsumer):
-    """未来：Redis Streams，支持消费者组、ACK、死信队列
-    change_events 表仍然保留作为事件持久化层（source of truth），
-    Redis Streams 作为通知加速层，change_events 表仍为 source of truth。
-    """
-    ...
-```
+暂不采纳。
 
-### 升级时的注意事项
+### 当前拒绝原因
 
-- `change_events` 表保留，作为事件的 source of truth
-- 消息队列作为通知加速层，不替代 PG 存储
-- 需要处理 exactly-once 语义（outbox + 消费者幂等）
-- 候选技术：Redis Streams（轻量）、NATS JetStream（云原生）、Kafka（重量级，大概率不需要）
+- Session 3 已冻结：`change_events` 是唯一 source of truth，`LISTEN/NOTIFY` 只做 wake-up hint。
+- 在单实例或低规模阶段，队列不会提升正确性，只会增加基础设施和语义混乱风险。
+- 如果现在引入队列，最容易犯的错误是把“唤醒层”误写成“事件持久化层”，直接破坏已冻结的 outbox 语义。
 
----
+### 重开前提
 
-## C. 对外接口：SDK-only → MCP Server
+- 传播引擎进入多实例部署，或
+- outbox 领取/补扫已成为明确瓶颈，或
+- 出现死信、消费组、事件回放等当前机制无法满足的需求。
 
-### 现状
+### 重开时必须重验的假设
 
-MVP 阶段 ContextHub 通过 Python SDK + OpenClaw Plugin 对接 Agent。只有 OpenClaw 用户能使用 ContextHub。
+- `change_events` 是否仍保持 source of truth。
+- 队列是否只承担唤醒/分发，而不是替代持久化。
+- at-least-once + 幂等边界是否与当前规则兼容。
 
-### 为什么需要 MCP
+### 重开入口
 
-Anthropic 的 Model Context Protocol (MCP) 已成为 Agent 连接外部数据源的事实标准。ContextHub 作为"上下文管理中间件"，天然适合暴露为 MCP Server。提供 MCP 接口后，ContextHub 可以被任何支持 MCP 的 Agent 框架使用（Claude Desktop, Cursor, Cline, 各种 LangGraph agent 等），不再硬绑定 OpenClaw。
+- 主入口：`06-change-propagation.md`
 
-### 升级方案
+## ADR-C：path ACL → ReBAC / Zanzibar
 
-将 ContextHub 的核心操作映射为 MCP tools/resources：
+### 当前结论
 
-| ContextHub 操作 | MCP 映射 |
-|-----------------|----------|
-| `ls` | MCP Resource（列出 ctx:// 路径下的子项） |
-| `read` | MCP Resource（读取 context 内容） |
-| `grep` | MCP Tool（语义搜索） |
-| `stat` | MCP Tool（查看元信息） |
-| `contexthub_store` | MCP Tool（写入记忆） |
-| `contexthub_promote` | MCP Tool（提升记忆） |
-| `contexthub_feedback` | MCP Tool（报告反馈） |
+暂不采纳。
 
-OpenClaw Plugin 可以作为 MCP 之上的薄包装——Plugin 内部通过 MCP 客户端调用 ContextHub MCP Server，而非直接调用 SDK。
+### 当前拒绝原因
 
-### 何时需要升级
+- 当前访问模型是“默认可见性 / 所有权基线 + path ACL overlay”，它和团队路径、`promote` 共享语义是对齐的。
+- 现阶段没有证据表明 path ACL 无法支撑已知的例外授权需求。
+- 过早升级到 ReBAC / Zanzibar 会把 ACL 问题从“是否需要例外规则”放大成“是否重建授权模型”，成本远高于收益。
 
-- 需要支持 OpenClaw 以外的 Agent 框架
-- 希望 ContextHub 可以直接在 Claude Desktop / Cursor 等工具中使用
-- 需要标准化的 Agent-Tool 对接协议
+### 重开前提
+
+- 需要表达稳定的跨对象关系授权，且 path-based principal/resource pattern 已无法表达。
+- 或策略数量、层级冲突、评估延迟已经成为明确运维问题。
+
+### 重开时必须重验的假设
+
+- 默认可见性是否仍然是第一层基线，而不是被新模型取代。
+- 关系图建模是否真的比路径模型更贴合资源关系。
+- 引入关系查询后，读写路径和评估延迟是否仍满足系统预算。
+
+### 重开入口
+
+- 主入口：`05-access-control-audit.md`
+
+## 维护规则
+
+- 本文件只记录替代架构 ADR，不记录 backlog 功能项。
+- 若某个条目开始进入排期，必须先从本文件移出，再进入对应 owner 文档展开。
+- 所有 ADR 的总表与状态，以 `14-adr-backlog-register.md` 为准。

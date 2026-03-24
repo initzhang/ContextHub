@@ -280,14 +280,10 @@ db9 和 ContextHub 处于架构栈的不同层级：
 
 db9 的 `embedding()` SQL 函数验证了"embedding 内置于数据库"的可行性。ContextHub 已将独立向量库（ChromaDB/Milvus）替换为 pgvector 扩展，L0 embedding 与元数据同库同事务，消除双写对账问题。
 
-**2. "文件作为入口"的数据导入范式（可探索）**
+**2. 不进入当前路线图的观察**
 
-db9 作者强调"文件作为中心（以及入口）。数据只要进入，系统便可以理解一切"。ContextHub 的 CatalogConnector 当前是 API 驱动的拉取模式，可考虑增加文件推送模式 — 用户/DBA 直接上传 DDL 文件或 CSV 样本数据，系统自动解析并生成 L0/L1 上下文，降低非 Agent 用户的接入门槛。
+- “文件作为入口”的导入范式：目前只保留为 related works 观察，不进入当前 roadmap。若未来出现明确的非 Agent 导入需求，应重新作为独立问题立项，而不是沿用这里的开放式设想。
+- `pg_cron` 下沉定时任务：这是局部实现选择，不是架构路线项。是否采用应在具体部署和运维约束下再决定。
+- 环境快照用于评估实验：这可以作为未来 ECMB 执行时的实验方法，但不是产品能力，也不单列为 future 主题。
 
-**3. pg_cron 下沉定时任务（可选采纳）**
-
-db9 将 cron 内置于数据库层。ContextHub 的 Lifecycle Manager 和 CatalogSync 可考虑用 pg_cron 扩展执行简单的定时 SQL（如归档过期上下文），减少应用层定时任务。
-
-**4. 环境分支用于评估实验**
-
-db9 的 `branch create` 启发了 ContextHub 的 A/B 消融实验可以利用 PG 环境快照（`pg_dump` + `pg_restore` 或 Docker volume snapshot）实现更干净的实验隔离。
+以上分流结果统一见 `14-adr-backlog-register.md`。

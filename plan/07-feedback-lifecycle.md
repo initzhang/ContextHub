@@ -1,5 +1,7 @@
 # 07 — 上下文质量反馈与生命周期管理
 
+> **能力边界**：本章是明确后置 backlog 的 owner 文档。`context_feedback`、`lifecycle_policies` 及其相关服务 / 路由不进入初始 migration，也不属于当前 MVP 协作闭环的必做项；触发条件与重开入口见 `14-adr-backlog-register.md`。
+
 ## 质量反馈闭环
 
 ### 问题
@@ -27,11 +29,13 @@ class ContextFeedback:
 ```
 
 > **观测通道说明**：判断 `adopted` vs `ignored` 需要知道 Agent 的生成输出。ContextHub 作为后端中间件无法直接获取 Agent 输出。
-> - **MVP 阶段**：仅支持显式反馈——Agent 通过 `contexthub_feedback` tool 主动报告 adopted/ignored。
+> - **如后续先做最小版本**：可先支持显式反馈——Agent 通过 `contexthub_feedback` tool 主动报告 adopted/ignored。
 > - **后续增强**：通过 OpenClaw 插件的 `afterTurn` 方法，将 Agent 输出摘要 + 本轮检索的 context URI 列表一起发送给 ContextHub feedback API，由服务端做文本相似度对比推断 adopted/ignored。
 > - **遗留问题**：OpenClaw `afterTurn` 是否能获取 Agent 完整输出？实现时需调研确认。
 
 反馈记录存入 PG：
+
+> **实现边界**：下表只冻结未来表形状，避免语义漂移；不要求在初版代码骨架中创建。
 
 ```sql
 CREATE TABLE context_feedback (
@@ -90,7 +94,9 @@ ORDER BY active_count DESC;
 
 ### 上下文状态机
 
-状态存储在 `contexts.status` 列中：
+> **权威定义**：状态枚举和时间戳字段见 00a §5.1 和 §5.3。
+
+状态存储在 `contexts.status` 列中，每次状态转换同步写入对应的时间戳列：
 
 ```
                               审核通过
@@ -98,24 +104,26 @@ ORDER BY active_count DESC;
           创建 ──────────────────────→ active
                                          │ 标记过时(变更传播) 或 超过 N 天未访问
                                          ▼
-                                       stale   ←── status = 'stale'
+                                       stale   ←── stale_at = NOW()
                                          │ 超过 M 天仍为 stale 且未被访问
                                          ▼
-                                      archived ←── 从向量索引中移除，PG 行保留
+                                      archived ←── archived_at = NOW()，从向量索引中移除
                                          │ 超过 K 天（可选）
                                          ▼
-                                      deleted  ←── PG 行标记 deleted（或移至冷存储）
+                                      deleted  ←── deleted_at = NOW()
 
 注：pending_review 仅用于记忆提升审核流程（MVP 阶段跳过，直接进入 active）。
 ```
 
 状态转换通过 PG 操作实现：
-- `active → stale`：`UPDATE contexts SET status = 'stale'`（批量/定时任务按策略更新）；单条传播或按主键更新时用 `UPDATE contexts SET status = 'stale' WHERE id = $1`（亦可用 `WHERE uri = $1`，URI 仍唯一）
-- `stale → active`：`UPDATE contexts SET status = 'active', last_accessed_at = NOW() WHERE id = $1`（或 `WHERE uri = $1`）
-- `stale → archived`：清除 `l0_embedding` 列 + `UPDATE contexts SET status = 'archived' WHERE id = $1`（或 `WHERE uri = $1`）
-- `archived → active`：重新生成 embedding 回填 `l0_embedding` + `UPDATE contexts SET status = 'active' WHERE id = $1`（或 `WHERE uri = $1`）
+- `active → stale`：`UPDATE contexts SET status = 'stale', stale_at = NOW() WHERE id = $1`
+- `stale → active`：`UPDATE contexts SET status = 'active', stale_at = NULL, last_accessed_at = NOW() WHERE id = $1`
+- `stale → archived`：`UPDATE contexts SET status = 'archived', archived_at = NOW(), l0_embedding = NULL WHERE id = $1`
+- `archived → active`：重新生成 embedding 回填 `l0_embedding` + `UPDATE contexts SET status = 'active', archived_at = NULL WHERE id = $1`
 
 ### 生命周期策略配置
+
+> **实现边界**：`lifecycle_policies` 为 post-MVP 配置表，不进入初始 migration。
 
 ```sql
 CREATE TABLE lifecycle_policies (
@@ -139,21 +147,20 @@ INSERT INTO lifecycle_policies VALUES
 
 ```sql
 -- 标记过期的 active 上下文为 stale
-UPDATE contexts c SET status = 'stale'
+UPDATE contexts c SET status = 'stale', stale_at = NOW()
 FROM lifecycle_policies lp
 WHERE c.context_type = lp.context_type AND c.scope = lp.scope
   AND c.status = 'active'
   AND lp.stale_after_days > 0
   AND c.last_accessed_at < NOW() - (lp.stale_after_days || ' days')::interval;
 
--- 归档过期的 stale 上下文
-UPDATE contexts c SET status = 'archived'
+-- 归档过期的 stale 上下文（基于 stale_at 计时）
+UPDATE contexts c SET status = 'archived', archived_at = NOW(), l0_embedding = NULL
 FROM lifecycle_policies lp
 WHERE c.context_type = lp.context_type AND c.scope = lp.scope
   AND c.status = 'stale'
   AND lp.archive_after_days > 0
-  AND c.updated_at < NOW() - (lp.archive_after_days || ' days')::interval;
--- 同时清除 l0_embedding 列（同一事务内执行，无跨系统问题）
+  AND c.stale_at < NOW() - (lp.archive_after_days || ' days')::interval;
 ```
 
 ### 湖表同步删除
@@ -166,11 +173,10 @@ async def handle_table_deleted(self, table_uri: str):
     async with self.pg.transaction():
         # 1. 归档该表的 context（目录侧按 URI 定位）
         await self.pg.execute("UPDATE contexts SET status = 'archived' WHERE uri = $1", table_uri)
-        # 2. 发出变更事件
+        # 2. 发出变更事件（同一事务内；trigger 会在 commit 后自动 NOTIFY，无需手动调用）
         await self.pg.execute("""
-            INSERT INTO change_events (context_id, change_type, actor)
-            VALUES ($1, 'deleted', 'catalog_sync')
-        """, context_id)
-    # 3. 传播引擎处理：标记依赖此表的 cases/patterns 为 stale
-    await self.pg.execute("NOTIFY context_changed, $1", context_id)
+            INSERT INTO change_events (context_id, account_id, change_type, actor)
+            VALUES ($1, $2, 'deleted', 'catalog_sync')
+        """, context_id, ctx.account_id)
+    # 3. 事务提交后，change_events trigger 自动发出 NOTIFY → 传播引擎标记依赖方 stale
 ```

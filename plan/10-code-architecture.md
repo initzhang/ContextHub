@@ -1,12 +1,24 @@
 # 10 — 代码架构设计
 
-基于 01-09 设计文档，解决从设计到代码的 5 个关键缺失：项目结构、依赖注入、API 端点、pgvector 向量检索、L0/L1 生成。
+基于 `00a-canonical-invariants.md` 和 `01-09` 的冻结决议，本文档把实现边界、依赖方向、请求级数据库执行模型、API 分层和实施顺序写成唯一的 canonical 版本。
+
+本文件的目标只有一个：实现者拿到文档后，不再需要自己做任何产品级架构决策。
 
 ---
 
-## 一、项目目录结构
+## 一、实现边界与默认假设
 
-```
+- **MVP Core**：验证“私有写入 → 晋升共享 → 跨 Agent 复用 → Skill 更新 → 下游 stale / advisory 感知 → retry/recovery”这条横向闭环。
+- **Carrier-Specific**：数据湖元数据、`sql-context` 组装、企业数据分析 / Text-to-SQL demo 是首个垂直载体，用来制造可复现的共享、版本和传播场景，但不主导 MVP 的主实施顺序。
+- **Post-MVP Reserved**：显式 ACL allow/deny/mask、审计日志、反馈闭环、生命周期管理，以及对应路由与表结构，全部明确后置，不进入初始代码骨架和初始 migration。触发条件与 owner 见 `14-adr-backlog-register.md`。
+
+---
+
+## 二、项目结构
+
+### 2.1 MVP Core + Carrier-Specific 骨架
+
+```text
 contexthub/
 ├── pyproject.toml
 ├── alembic.ini
@@ -17,240 +29,313 @@ contexthub/
 ├── src/
 │   └── contexthub/
 │       ├── __init__.py
-│       ├── main.py                    # FastAPI app 工厂 + lifespan
-│       ├── config.py                  # pydantic-settings
+│       ├── main.py
+│       ├── config.py
 │       │
-│       ├── models/                    # Pydantic 数据模型
-│       │   ├── context.py             # Context, ContextLevel, ContextType, ContextStatus
-│       │   ├── request.py             # RequestContext, SearchRequest/Response
-│       │   ├── datalake.py            # TableMetadata, Lineage, TableRelationship, QueryTemplate
-│       │   ├── skill.py               # SkillVersion, SkillSubscription
-│       │   ├── memory.py              # ContextFeedback, MemoryCategory
-│       │   ├── access.py              # AccessPolicy
-│       │   └── team.py                # Team, TeamMembership
+│       ├── models/
+│       │   ├── context.py
+│       │   ├── request.py
+│       │   ├── team.py
+│       │   ├── skill.py
+│       │   ├── memory.py
+│       │   └── datalake.py              # carrier-specific
 │       │
-│       ├── db/                        # 数据库层
-│       │   ├── pool.py                # asyncpg 连接池（create_pool / close_pool）
-│       │   ├── repository.py          # PgRepository：封装 asyncpg，提供 fetch/execute/transaction
-│       │   └── queries/               # 原始 SQL 常量（按领域分文件）
+│       ├── db/
+│       │   ├── pool.py
+│       │   ├── repository.py            # PgRepository.session() + ScopedRepo
+│       │   └── queries/
 │       │       ├── contexts.py
 │       │       ├── dependencies.py
 │       │       ├── events.py
-│       │       ├── datalake.py
 │       │       ├── skills.py
-│       │       ├── access.py
-│       │       ├── audit.py
-│       │       ├── feedback.py
-│       │       ├── lifecycle.py
-│       │       └── teams.py
+│       │       ├── teams.py
+│       │       └── datalake.py          # carrier-specific
 │       │
-│       ├── store/                     # URI 路由层
-│       │   └── context_store.py       # ContextStore: read/write/search/ls/stat
+│       ├── store/
+│       │   └── context_store.py         # read/write/ls/stat（不含 search）
 │       │
-│       ├── services/                  # 业务服务层
-│       │   ├── context_service.py     # CRUD、L0/L1/L2 管理
-│       │   ├── memory_service.py      # 提取、去重、热度、共享提升
-│       │   ├── skill_service.py       # 版本管理、发布/订阅
-│       │   ├── retrieval_service.py   # 向量检索 L0 → PG 读 L1 rerank → 加载 L2
-│       │   ├── indexer_service.py     # 异步 L0/L1 生成 + 向量索引更新
-│       │   ├── propagation_engine.py  # PG LISTEN/NOTIFY → 查依赖 → 执行规则
-│       │   ├── acl_service.py         # check_access / filter_and_mask
-│       │   ├── audit_service.py       # 写审计日志
-│       │   ├── feedback_service.py    # 反馈采集、质量评分
-│       │   ├── lifecycle_service.py   # 状态机、定时归档
-│       │   └── catalog_sync_service.py # CatalogConnector → PG 同步
+│       ├── services/
+│       │   ├── acl_service.py           # 默认可见性 / 默认写权限
+│       │   ├── context_service.py       # 通用 CRUD 编排
+│       │   ├── memory_service.py        # promote / derived_from / 团队共享
+│       │   ├── skill_service.py         # publish / subscribe / read_resolved
+│       │   ├── retrieval_service.py     # 唯一 search owner
+│       │   ├── indexer_service.py       # L0/L1 生成 + embedding 更新
+│       │   ├── propagation_engine.py    # change_events 消费 / retry / sweep
+│       │   ├── catalog_sync_service.py  # carrier-specific
+│       │   └── reconciler_service.py    # carrier-specific：embedding 补写
 │       │
-│       ├── propagation/               # 变更传播规则
-│       │   ├── base.py                # PropagationRule ABC, PropagationAction
-│       │   ├── skill_version_rule.py  # Level 1: 纯规则
-│       │   ├── table_schema_rule.py   # Level 1/2: 自动重新生成
-│       │   ├── derived_memory_rule.py # Level 2: 模板替换
-│       │   ├── complex_rule.py        # Level 3: LLM 推理
-│       │   └── registry.py            # dep_type → Rule 映射
+│       ├── propagation/
+│       │   ├── base.py
+│       │   ├── skill_dep_rule.py
+│       │   ├── subscription_notify_rule.py
+│       │   ├── table_schema_rule.py
+│       │   ├── derived_memory_rule.py
+│       │   ├── complex_rule.py
+│       │   └── registry.py
 │       │
-│       ├── connectors/                # 外部数据源
-│       │   ├── base.py                # CatalogConnector ABC
-│       │   └── mock_connector.py      # 开发用 Mock
+│       ├── retrieval/
+│       │   ├── router.py
+│       │   ├── vector_strategy.py
+│       │   ├── rerank.py
+│       │   ├── tree_strategy.py         # phase 2 optional
+│       │   └── keyword_strategy.py      # phase 2 optional
 │       │
-│       ├── llm/                       # LLM 调用抽象
-│       │   ├── base.py                # LLMClient ABC + EmbeddingClient ABC
-│       │   ├── openai_client.py       # OpenAI embedding + chat
-│       │   └── factory.py             # create_llm_client() / create_embedding_client()
+│       ├── generation/
+│       │   ├── base.py
+│       │   ├── table_schema.py
+│       │   ├── skill.py
+│       │   ├── memory.py
+│       │   └── resource.py
 │       │
-│       ├── generation/                # L0/L1 内容生成
-│       │   ├── base.py                # ContentGenerator + GenerationStrategy ABC
-│       │   ├── table_schema.py        # TableSchemaStrategy（LLM）
-│       │   ├── skill.py               # SkillStrategy（纯模板）
-│       │   ├── memory.py              # MemoryStrategy（模板 + 可选 LLM）
-│       │   └── resource.py            # ResourceStrategy（LLM）
+│       ├── connectors/
+│       │   ├── base.py                  # carrier-specific
+│       │   └── mock_connector.py        # carrier-specific
 │       │
-│       ├── retrieval/                # 检索策略层（可插拔）
-│       │   ├── router.py             # RetrievalRouter：按 context_type 分发检索策略
-│       │   ├── vector_strategy.py    # 默认策略：向量检索 L0 → PG L1 rerank
-│       │   ├── rerank.py             # RerankStrategy ABC + KeywordRerankStrategy（BM25）
-│       │   ├── tree_strategy.py      # 长文档树导航检索（Phase 2 可选）
-│       │   └── keyword_strategy.py   # 长文档 ripgrep 关键词检索（Phase 2 可选）
+│       ├── llm/
+│       │   ├── base.py
+│       │   ├── openai_client.py
+│       │   └── factory.py
 │       │
-│       ├── ingestion/                # 内容入库管线
-│       │   └── long_document.py      # LongDocumentIngester（Phase 2 可选）
-│       │
-│       └── api/                       # FastAPI 路由
-│           ├── deps.py                # Depends 工厂函数
-│           ├── middleware.py           # 认证中间件（含 RLS SET LOCAL）
+│       └── api/
+│           ├── deps.py
+│           ├── middleware.py            # 认证 / RequestContext 注入；不执行 SET LOCAL
 │           └── routers/
-│               ├── contexts.py        # /api/v1/contexts
-│               ├── search.py          # /api/v1/search
-│               ├── memories.py        # /api/v1/memories
-│               ├── skills.py          # /api/v1/skills
-│               ├── datalake.py        # /api/v1/datalake
-│               ├── tools.py           # /api/v1/tools（LLM tool use: ls/read/grep/stat）
-│               └── admin.py           # /api/v1/admin
+│               ├── contexts.py
+│               ├── search.py
+│               ├── memories.py
+│               ├── skills.py
+│               ├── tools.py
+│               └── datalake.py          # carrier-specific
 │
-├── sdk/                               # Python SDK（独立可发布包）
+├── sdk/
 │   ├── pyproject.toml
-│   └── src/
-│       └── contexthub_sdk/
-│           ├── __init__.py
-│           ├── client.py              # ContextHubClient：HTTP 封装
-│           ├── models.py              # SDK 侧 Pydantic 模型
-│           └── exceptions.py
+│   └── src/contexthub_sdk/
+│       ├── __init__.py
+│       ├── client.py
+│       ├── models.py
+│       └── exceptions.py
 │
-├── plugins/                           # Agent 框架插件
-│   └── openclaw/                      # OpenClaw Plugin
+├── plugins/
+│   └── openclaw/
 │       ├── pyproject.toml
-│       ├── plugin.py                  # 注册 tools + lifecycle hooks
-│       └── tools.py                   # contexthub_search/store/promote/feedback
-│
-├── docker-compose.yml                 # PG (with pgvector) + ContextHub Server
-├── docker-compose.dev.yml             # 开发环境覆盖（端口映射、volume 挂载）
+│       ├── plugin.py
+│       └── tools.py                     # search / store / promote / skill_publish
 │
 └── tests/
     ├── conftest.py
-    ├── test_context_store.py
+    ├── test_visibility.py
+    ├── test_memory_promote.py
+    ├── test_skill_resolution.py
     ├── test_retrieval.py
-    ├── test_propagation.py
-    └── ...
+    └── test_propagation.py
 ```
 
+### 2.2 Post-MVP Reserved（不进入初始 skeleton / 初始 migration）
+
+- `models/access.py`
+- `services/audit_service.py`
+- `services/feedback_service.py`
+- `services/lifecycle_service.py`
+- `api/routers/feedback.py`
+- `api/routers/admin.py`
+- `db/queries/access.py`
+- `db/queries/audit.py`
+- `db/queries/feedback.py`
+- `db/queries/lifecycle.py`
+- 对应 PG 表：`access_policies`、`audit_log`、`context_feedback`、`lifecycle_policies`
+
 模块边界原则：
-- `models/` 纯数据定义，无业务逻辑，无 IO
-- `db/` 只做 SQL 执行，不含业务判断
-- `store/` 是 URI 路由层，协调 PG 读写（含 pgvector 向量检索）+ ACL
-- `services/` 是业务逻辑层，依赖 `store/` 和 `db/`
-- `retrieval/` 是检索策略层，可插拔。`services/retrieval_service.py` 调用 `retrieval/router.py`
-- `ingestion/` 是内容入库管线，处理外部内容（长文档等）的预处理和写入
-- `api/` 只做 HTTP 协议转换，不含业务逻辑
-- `sdk/` 是独立包，只依赖 HTTP + Pydantic，不依赖 server 内部模块
-- `plugins/` 是 Agent 框架适配层，依赖 `sdk/`
+- `store/` 只负责 URI 路由、默认读写权限检查后的 `read/write/ls/stat`，**不承担 search**
+- `services/retrieval_service.py` 是唯一检索入口，统一承载 `/search`、tool `grep` 和 carrier-specific `sql-context`
+- `db/` 只提供 request-scoped `ScopedRepo` 执行能力和 SQL 常量，不做业务判断
+- `api/` 只做协议转换、身份解析、依赖注入，不在 middleware 中做 `SET LOCAL`
+- `sdk/` 只封装 HTTP + typed models，不依赖 server 内部模块
+- `plugins/` 只做 OpenClaw 适配，不持有产品级语义
 
 ---
 
-## 二、依赖注入与服务装配
+## 三、模块边界与 Canonical Owner
 
-### 2.1 config.py
+| 模块 | Canonical Owner | 明确不负责 |
+|------|-----------------|------------|
+| `ContextStore` | `ctx://` URI 到 PG 行的 `read/write/ls/stat` 路由；乐观锁；默认 ACL 检查后的读写落库 | 不做 search；不做版本解析；不自行开连接 |
+| `RetrievalService` | 唯一 search owner；embedding、pgvector 检索、L1 rerank、默认可见性过滤；carrier-specific `sql-context` 组装 | 不负责通用写入；不负责 Skill 版本解析 |
+| `SkillService` | Skill 版本发布、订阅、`read_resolved()` 版本解析 | 不负责通用 search；不持有传播 outbox |
+| `MemoryService` | promote、`derived_from` 注册、团队共享路径写入 | 不负责审核流；不负责 audit_log |
+| `ACLService` | MVP 的默认可见性 / 默认写权限；明确后置 backlog 的显式 ACL overlay 挂载点（见 `14-adr-backlog-register.md`） | 不持有 canonical truth；不自行开连接 |
+| `PropagationEngine` | `change_events` 消费、delivery 状态机、retry / sweep / 幂等副作用调度 | 不负责业务内容生成本身；不依赖通知表 |
+| `PgRepository` | request-scoped `ScopedRepo` session factory | 不是全局 SQL executor；不允许跨请求复用事务上下文 |
+| `SDK` | 对外 typed client；把 `ctx.read()` / `ctx.search()` / `ctx.memory.promote()` 映射到 HTTP API | 不实现服务端语义 |
+| `OpenClaw Plugin` | 注册 tools；`assemble` 注入 recall；`afterTurn` auto-capture；委托 compaction | 不在插件层重复实现版本解析、传播或 ACL 规则 |
+
+Canonical truth 归属：
+- `contexts` / `dependencies` / `change_events` / `skill_versions` / `skill_subscriptions` 的事实源都在 PG
+- `SkillService` 是唯一版本解析 owner
+- `RetrievalService` 是唯一检索 owner
+- `PropagationEngine` 是唯一传播消费 owner
+- `ContextStore` 是唯一 URI 文件语义 owner（仅限 `read/write/ls/stat`）
+
+依赖方向：
+
+```text
+routers
+  ├── contexts / memories / skills -> ContextService / MemoryService / SkillService
+  │                                   -> ContextStore -> ScopedRepo
+  ├── search / tools.grep           -> RetrievalService -> retrieval strategies -> ScopedRepo
+  └── datalake                      -> CatalogSyncService / RetrievalService -> ScopedRepo
+
+ContextService / MemoryService / SkillService
+  -> ACLService / ContextStore / IndexerService
+
+PropagationEngine
+  -> PgRepository.session(account_id) -> rules -> ContextStore / SkillService / IndexerService
+```
+
+---
+
+## 四、数据库执行模型（强冻结）
+
+### 4.1 唯一允许的模式
+
+每个 HTTP 请求、每个传播事件、每次租户 sweep，都必须显式创建一个 request-scoped / work-item-scoped `ScopedRepo`。所有 SQL 都在这个 `ScopedRepo` 上执行。
+
+唯一 canonical 形态：
 
 ```python
-from pydantic_settings import BaseSettings
+@dataclass
+class RequestContext:
+    account_id: str
+    agent_id: str
+    expected_version: int | None = None
 
-class Settings(BaseSettings):
-    model_config = {"env_prefix": "CTX_", "env_file": ".env"}
 
-    # PostgreSQL
-    pg_dsn: str = "postgresql://ctx:ctx@localhost:5432/contexthub"
-    pg_min_pool: int = 5
-    pg_max_pool: int = 20
+class ScopedRepo:
+    def __init__(self, conn: asyncpg.Connection):
+        self._conn = conn
 
-    # 向量索引（pgvector，与 PG 同库，无额外配置）
-    embedding_index_type: str = "hnsw"   # "hnsw" | "ivfflat"
+    async def fetch(self, sql: str, *args): ...
+    async def fetchrow(self, sql: str, *args): ...
+    async def fetchval(self, sql: str, *args): ...
+    async def execute(self, sql: str, *args): ...
 
-    # LLM
-    llm_backend: str = "openai"          # "openai" | "anthropic"
-    openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
-    embedding_model: str = "text-embedding-3-small"
-    embedding_dim: int = 1536
 
-    # CatalogConnector
-    catalog_backend: str = "mock"        # "mock" | "hive" | "iceberg"
+class PgRepository:
+    def __init__(self, pool: asyncpg.Pool):
+        self._pool = pool
 
-    # 传播引擎
-    propagation_enabled: bool = True
-
-    # Rerank 策略
-    rerank_strategy: str = "keyword"     # "keyword" | "cross_encoder" | "llm"
-
-    # pgvector embedding 一致性检查
-    reconcile_interval_minutes: int = 60  # 0 = 禁用
-
-    # 长文档（Phase 2 可选）
-    doc_store_root: str = "/data/docs"
-    long_document_enabled: bool = False
+    @asynccontextmanager
+    async def session(self, account_id: str) -> AsyncIterator[ScopedRepo]:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL app.account_id = $1", account_id)
+                yield ScopedRepo(conn)
 ```
 
-### 2.2 服务依赖图
+冻结规则：
+- `BEGIN + SET LOCAL app.account_id + COMMIT/ROLLBACK` 只允许在 `PgRepository.session(account_id)` 内执行
+- request 内所有 SQL 必须走同一个 `ScopedRepo`
+- `ContextStore`、`RetrievalService`、`SkillService`、`ACLService`、`IndexerService` 等内部模块**禁止**自己调用 `pool.acquire()` 或 `repo.session()`
+- middleware **不执行**任何 RLS SQL；它只做认证和 `RequestContext` 注入
+- `LISTEN` 长连接和业务 SQL 连接分离；`LISTEN` 连接不承担租户查询
 
+### 4.2 Request 级依赖注入
+
+```python
+# api/deps.py
+async def get_request_context(
+    x_account_id: str = Header(..., alias="X-Account-Id"),
+    x_agent_id: str = Header(..., alias="X-Agent-Id"),
+    if_match: int | None = Header(None, alias="If-Match"),
+) -> RequestContext:
+    return RequestContext(
+        account_id=x_account_id,
+        agent_id=x_agent_id,
+        expected_version=if_match,
+    )
+
+
+async def get_db(
+    request: Request,
+    ctx: RequestContext = Depends(get_request_context),
+) -> AsyncIterator[ScopedRepo]:
+    async with request.app.state.repo.session(ctx.account_id) as db:
+        yield db
 ```
-Settings → asyncpg.Pool → PgRepository
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-         EmbeddingClient  LLMClient     CatalogConnector
-              │               │
-              ▼               ▼
-         ACLService      ContentGenerator
-         AuditService    (table_schema/skill/memory/resource strategies)
-              │               │
-              ▼               ▼
-         ContextStore    IndexerService
-              │               │
-    ┌─────┬──┴──┬─────┐      │
-    ▼     ▼     ▼     ▼      ▼
- Context Memory Skill Retrieval  PropagationEngine
- Service Service Service Service  (background task)
+
+HTTP 路径的唯一调用方式：
+
+```python
+@router.post("/contexts", status_code=201)
+async def create_context(
+    body: CreateContextRequest,
+    ctx: RequestContext = Depends(get_request_context),
+    db: ScopedRepo = Depends(get_db),
+    svc: ContextService = Depends(get_context_service),
+):
+    return await svc.create(db, body, ctx)
 ```
 
-### 2.3 main.py — App Factory + Lifespan
+### 4.3 后台任务的唯一调用方式
 
-所有 service 在 lifespan 中一次性装配，通过构造函数注入依赖。不使用 DI 框架。
+```python
+class PropagationEngine:
+    async def process_event(self, event: ChangeEvent):
+        async with self.repo.session(event.account_id) as db:
+            await self._claim_event(db, event.id)
+            await self._dispatch_rules(db, event)
+            await self._finish_event(db, event.id)
+
+
+class ReconcilerService:
+    async def reconcile_account(self, account_id: str):
+        async with self.repo.session(account_id) as db:
+            ...
+```
+
+后台任务冻结规则：
+- 一个 event / 一次租户 sweep / 一次 catalog sync 处理，对应一个显式 `ScopedRepo`
+- worker 不能持有跨租户复用的事务上下文
+- `change_events` 的 `account_id` 必须足以驱动 tenant-scoped session 选择
+
+---
+
+## 五、依赖注入与服务装配
+
+所有 service 在 lifespan 中一次性装配；DB session 不在构造函数中注入，而由 `get_db` 依赖在请求级提供。
 
 ```python
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = Settings()
 
-    # 基础设施
     pool = await create_pool(settings)
     repo = PgRepository(pool)
     llm_client = create_llm_client(settings)
     embedding_client = create_embedding_client(settings)
     catalog_connector = create_catalog_connector(settings)
 
-    # 横切关注点
-    acl_service = ACLService(repo)
-    audit_service = AuditService(repo)
-
-    # 核心层
+    acl_service = ACLService()
     content_generator = ContentGenerator(llm_client)
-    context_store = ContextStore(repo, acl_service, audit_service)
-    indexer_service = IndexerService(repo, embedding_client, content_generator)
-    retrieval_service = RetrievalService(repo, embedding_client, acl_service)
+    context_store = ContextStore(acl_service)
+    indexer_service = IndexerService(content_generator, embedding_client)
+    retrieval_router = RetrievalRouter.default()
+    retrieval_service = RetrievalService(retrieval_router, embedding_client, acl_service)
 
-    # 业务服务
-    context_service = ContextService(repo, context_store, indexer_service)
-    memory_service = MemoryService(repo, context_store, indexer_service)
-    skill_service = SkillService(repo, context_store, indexer_service)
-    catalog_sync_service = CatalogSyncService(repo, catalog_connector, indexer_service, llm_client)
+    context_service = ContextService(context_store, indexer_service)
+    memory_service = MemoryService(context_store, indexer_service)
+    skill_service = SkillService(context_store, indexer_service)
+    catalog_sync_service = CatalogSyncService(catalog_connector, indexer_service, llm_client)
 
-    # 传播引擎（后台 asyncio task）
     rule_registry = PropagationRuleRegistry.default(indexer_service, llm_client)
-    propagation_engine = PropagationEngine(settings.pg_dsn, pool, rule_registry)
+    propagation_engine = PropagationEngine(repo, rule_registry)
 
-    # 挂到 app.state，供 Depends 使用
+    app.state.repo = repo
     app.state.context_service = context_service
     app.state.memory_service = memory_service
     app.state.skill_service = skill_service
     app.state.retrieval_service = retrieval_service
-    # ... 其余 service 同理
+    app.state.catalog_sync_service = catalog_sync_service
 
     if settings.propagation_enabled:
         await propagation_engine.start()
@@ -261,377 +346,325 @@ async def lifespan(app: FastAPI):
     await pool.close()
 ```
 
-### 2.4 api/deps.py — Depends 链
+这里的关键不是“服务能拿到 repo”，而是：
+- 请求 SQL 一律通过 `get_db` 提供的 `ScopedRepo`
+- 后台 worker SQL 一律通过 `repo.session(account_id)` 临时获取 `ScopedRepo`
+- 不存在“全局 repo 直接执行请求 SQL”的路径
+
+### 5.1 核心接口冻结
 
 ```python
-async def get_request_context(
-    x_account_id: str = Header(...),
-    x_agent_id: str = Header(...),
-    if_match: Optional[int] = Header(None, alias="If-Match"),  # 乐观锁版本号
-) -> RequestContext:
-    return RequestContext(account_id=x_account_id, agent_id=x_agent_id, expected_version=if_match)
+class ContextStore:
+    async def read(self, db: ScopedRepo, uri: str, level: ContextLevel, ctx: RequestContext) -> str: ...
+    async def write(self, db: ScopedRepo, uri: str, level: ContextLevel, content: str, ctx: RequestContext) -> None: ...
+    async def ls(self, db: ScopedRepo, path: str, ctx: RequestContext) -> list[str]: ...
+    async def stat(self, db: ScopedRepo, uri: str, ctx: RequestContext) -> ContextStat: ...
 
-def get_context_service(request: Request) -> ContextService:
-    return request.app.state.context_service
 
-# 其余 service 同理：get_memory_service, get_skill_service, ...
+class RetrievalService:
+    async def search(self, db: ScopedRepo, request: SearchRequest, ctx: RequestContext) -> SearchResponse: ...
+
+
+class SkillService:
+    async def read_resolved(
+        self,
+        db: ScopedRepo,
+        skill_id: UUID,
+        agent_id: str,
+        requested_version: int | None = None,
+    ) -> SkillContent: ...
 ```
 
-Endpoint 使用方式：
-```python
-@router.post("/contexts", status_code=201)
-async def create_context(
-    body: CreateContextRequest,
-    ctx: RequestContext = Depends(get_request_context),
-    svc: ContextService = Depends(get_context_service),
-):
-    return await svc.create(body, ctx)
-```
-
-### 2.5 PropagationEngine 后台任务
-
-- 用独立的 asyncpg 连接做 `LISTEN`（不能用连接池，LISTEN 需要长连接）
-- `_on_notify` 回调中用 debounce（2 秒窗口）合并同一 `dependency_id`（被变更的 context）的多次 NOTIFY
-- debounce 窗口结束后，`process_event` 处理该 context 的**所有**未处理事件（不是只取最新一条）
-- `process_event` 内部捕获异常，单个依赖方处理失败不影响其他依赖方
-- 失败的事件保留 `processed = FALSE`，下次启动时自动重试
-- MVP 限制：单实例部署。多实例需要 `SELECT FOR UPDATE SKIP LOCKED`
-- lifespan shutdown 时 `cancel()` task + 关闭 LISTEN 连接
+### 5.2 Skill 版本解析冻结
 
 ```python
-class PropagationEngine:
-    async def start(self):
-        self._listen_conn = await asyncpg.connect(self._dsn)
-        await self._listen_conn.add_listener("context_changed", self._on_notify)
+class SkillService:
+    async def read_resolved(
+        self,
+        db: ScopedRepo,
+        skill_id: UUID,
+        agent_id: str,
+        requested_version: int | None = None,
+    ) -> SkillContent:
+        if requested_version is not None:
+            return await self._read_version(db, skill_id, requested_version)
 
-    def _on_notify(self, conn, pid, channel, payload):
-        # debounce: 2 秒内同一 dependency_id 只触发一次处理
-        # 注意：debounce 合并的是 NOTIFY，不是事件本身。
-        # process_event 会读取该 context 的所有未处理事件。
-        dependency_id = payload
-        if dependency_id in self._pending:
-            self._pending[dependency_id].cancel()
-        loop = asyncio.get_running_loop()
-        self._pending[dependency_id] = loop.call_later(
-            2.0, lambda: asyncio.create_task(self._safe_process(dependency_id))
+        sub = await db.fetchrow(
+            "SELECT pinned_version FROM skill_subscriptions "
+            "WHERE skill_id = $1 AND agent_id = $2",
+            skill_id, agent_id,
         )
 
-    async def process_event(self, dependency_id):
-        # 1. 读取该 context 的所有未处理 change_events（按时间正序）
-        # 2. 查询 dependencies WHERE dependency_id = …（找出依赖该资源的 dependent）
-        # 3. 对每个事件 × 每个依赖方执行 registry.get(dep_type).evaluate()
-        # 4. 执行 action: mark_stale / auto_update / notify
-        # 5. 每个事件处理完毕后标记 processed = TRUE
-        # 详见 06-change-propagation.md (6) 完整实现
+        if sub and sub["pinned_version"] is not None:
+            content = await self._read_version(db, skill_id, sub["pinned_version"])
+            latest_ver = await db.fetchval(
+                "SELECT MAX(version) FROM skill_versions "
+                "WHERE skill_id = $1 AND status = 'published'",
+                skill_id,
+            )
+            if latest_ver and latest_ver > sub["pinned_version"]:
+                content.advisory = (
+                    f"v{latest_ver} 已发布，当前 pin 在 v{sub['pinned_version']}"
+                )
+            return content
 
-    async def stop(self):
-        if self._listen_conn:
-            await self._listen_conn.close()
+        return await self._read_latest(db, skill_id)
 ```
+
+这意味着：
+- URI 默认返回 latest published
+- pinned 是读路径视角，不是新 URI
+- `SkillService` 是唯一版本解析 owner；`ContextStore` 不做版本判断
 
 ---
 
-## 三、FastAPI API 端点设计
+## 六、FastAPI API 分层
 
-### 完整路由表
+### 6.1 MVP Core
 
-| 方法 | 路径 | 功能 | Router |
-|------|------|------|--------|
-| **上下文 CRUD** |
-| `POST` | `/api/v1/contexts` | 创建上下文 | contexts.py |
-| `GET` | `/api/v1/contexts/{uri:path}` | 读取（query: `level=L0\|L1\|L2`） | contexts.py |
-| `PATCH` | `/api/v1/contexts/{uri:path}` | 更新内容 | contexts.py |
-| `DELETE` | `/api/v1/contexts/{uri:path}` | 标记删除 | contexts.py |
-| `GET` | `/api/v1/contexts/{uri:path}/stat` | 元信息（不含内容） | contexts.py |
-| `GET` | `/api/v1/contexts/{uri:path}/children` | 列出子项（ls 语义） | contexts.py |
-| `GET` | `/api/v1/contexts/{uri:path}/deps` | 查看依赖关系 | contexts.py |
-| **语义检索** |
-| `POST` | `/api/v1/search` | 向量检索 + Rerank | search.py |
-| `POST` | `/api/v1/search/sql-context` | Text-to-SQL 上下文组装 | search.py |
-| **记忆** |
-| `POST` | `/api/v1/memories` | 添加记忆 | memories.py |
-| `GET` | `/api/v1/memories` | 列出记忆（query: `category`, `scope`） | memories.py |
-| `POST` | `/api/v1/memories/promote` | 提升为团队共享 | memories.py |
-| **技能** |
-| `POST` | `/api/v1/skills/versions` | 发布新版本 | skills.py |
-| `GET` | `/api/v1/skills/{uri:path}/versions` | 版本历史 | skills.py |
-| `POST` | `/api/v1/skills/subscribe` | 订阅技能 | skills.py |
-| **反馈** |
-| `POST` | `/api/v1/feedback` | 记录上下文反馈 | search.py |
-| **数据湖** |
-| `POST` | `/api/v1/datalake/sync` | 触发 catalog 同步 | datalake.py |
-| `GET` | `/api/v1/datalake/{catalog}/{db}` | 列出表 | datalake.py |
-| `GET` | `/api/v1/datalake/{catalog}/{db}/{table}` | 表完整上下文 | datalake.py |
-| `GET` | `/api/v1/datalake/{catalog}/{db}/{table}/lineage` | 血缘查询 | datalake.py |
-| **LLM Tool Use** |
-| `POST` | `/api/v1/tools/ls` | 列目录 | tools.py |
-| `POST` | `/api/v1/tools/read` | 读内容 | tools.py |
-| `POST` | `/api/v1/tools/grep` | 语义搜索 | tools.py |
-| `POST` | `/api/v1/tools/stat` | 元信息 | tools.py |
-| **管理** |
-| `GET` | `/api/v1/admin/quality-report` | 低质量上下文报告 | admin.py |
-| `POST` | `/api/v1/admin/lifecycle/run` | 手动触发生命周期 | admin.py |
-| `GET` | `/api/v1/admin/propagation/status` | 传播引擎状态 | admin.py |
+| 方法 | 路径 | Owner | 说明 |
+|------|------|-------|------|
+| `POST` | `/api/v1/contexts` | `ContextService` | 创建上下文 |
+| `GET` | `/api/v1/contexts/{uri:path}` | `ContextStore` / `SkillService` | 普通 context 走 `ContextStore.read()`；Skill 走 `SkillService.read_resolved()` |
+| `PATCH` | `/api/v1/contexts/{uri:path}` | `ContextService` | 更新内容 |
+| `DELETE` | `/api/v1/contexts/{uri:path}` | `ContextService` | 标记删除 |
+| `GET` | `/api/v1/contexts/{uri:path}/stat` | `ContextStore` | 元信息 |
+| `GET` | `/api/v1/contexts/{uri:path}/children` | `ContextStore` | `ls` 语义 |
+| `GET` | `/api/v1/contexts/{uri:path}/deps` | `ContextService` | 查看依赖 |
+| `POST` | `/api/v1/search` | `RetrievalService` | 唯一通用 search 入口 |
+| `POST` | `/api/v1/memories` | `MemoryService` | 添加记忆 |
+| `GET` | `/api/v1/memories` | `MemoryService` | 列记忆 |
+| `POST` | `/api/v1/memories/promote` | `MemoryService` | promote 到团队共享 |
+| `POST` | `/api/v1/skills/versions` | `SkillService` | 发布 Skill 新版本 |
+| `GET` | `/api/v1/skills/{uri:path}/versions` | `SkillService` | 版本历史 |
+| `POST` | `/api/v1/skills/subscribe` | `SkillService` | 订阅 Skill |
+| `POST` | `/api/v1/tools/ls` | `ContextStore` | tool use 包装 |
+| `POST` | `/api/v1/tools/read` | `ContextStore` | tool use 包装 |
+| `POST` | `/api/v1/tools/grep` | `RetrievalService` | tool `grep` -> search |
+| `POST` | `/api/v1/tools/stat` | `ContextStore` | tool use 包装 |
 
-### 认证方式
+### 6.2 Carrier-Specific
 
-通过 HTTP Headers 传递身份信息（MVP 阶段简化）：
-- `X-API-Key`: API 密钥
-- `X-Account-Id`: 租户 ID
-- `X-Agent-Id`: Agent 标识
-- `If-Match`: 乐观锁版本号（PATCH 更新时必传，对应 `contexts.version`）
+| 方法 | 路径 | Owner | 说明 |
+|------|------|-------|------|
+| `POST` | `/api/v1/search/sql-context` | `RetrievalService` | 仅为首个垂直载体服务的上下文组装 |
+| `POST` | `/api/v1/datalake/sync` | `CatalogSyncService` | 触发 catalog 同步 |
+| `GET` | `/api/v1/datalake/{catalog}/{db}` | `CatalogSyncService` | 列表 |
+| `GET` | `/api/v1/datalake/{catalog}/{db}/{table}` | `RetrievalService` | 表完整上下文 |
+| `GET` | `/api/v1/datalake/{catalog}/{db}/{table}/lineage` | `RetrievalService` | 血缘查询 |
 
-响应中通过 `ETag` 返回当前版本号，客户端下次更新时回传 `If-Match`。版本不匹配返回 `409 Conflict`。
+### 6.3 Post-MVP Reserved
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| `POST` | `/api/v1/feedback` | 显式/隐式反馈上报 |
+| `GET/POST` | `/api/v1/admin/*` | 质量报告、生命周期、管理运维接口 |
+
+认证方式：
+- `X-API-Key`
+- `X-Account-Id`
+- `X-Agent-Id`
+- `If-Match`
+
+响应通过 `ETag` 返回当前版本号。版本不匹配返回 `409 Conflict`。
 
 ---
 
-## 四、pgvector 向量检索
+## 七、检索、生成与传播
 
-向量操作直接在 `PgRepository` 和 Service 层用 SQL 完成，不使用独立抽象层。pgvector 与 contexts 表同库，向量检索就是普通的 PG SQL 查询。
+### 7.1 检索唯一走 `RetrievalService`
 
-### EmbeddingClient（独立于 LLMClient）
+向量检索直接在 PG 上执行，不引入独立向量存储抽象层。`RetrievalService` 的 canonical 流程：
 
-```python
-class EmbeddingClient(ABC):
-    @abstractmethod
-    async def embed(self, text: str) -> list[float]: ...
-
-    @abstractmethod
-    async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
-
-    @property
-    @abstractmethod
-    def dim(self) -> int: ...
+```text
+query
+  -> EmbeddingClient.embed(query)
+  -> pgvector 检索 L0 + 标量过滤
+  -> 批量读取候选 L1
+  -> rerank
+  -> ACLService.filter_visible()
+  -> 按需加载 L2 / 结构化补充数据
 ```
 
-### 交互流程
+冻结规则：
+- `ContextStore` 不提供 `search()`
+- tool `grep`、API `/search`、carrier-specific `/search/sql-context` 都由 `RetrievalService` 统一承接
+- 默认可见性过滤属于检索结果裁剪的一部分，因此放在 `RetrievalService` 路径上，而不是塞回 `ContextStore`
 
-```
-写入: IndexerService → EmbeddingClient.embed(l0) → repo.update_embedding(context_id, vec)
-检索: RetrievalService → EmbeddingClient.embed(query) → repo 执行 pgvector SQL（向量距离 + 标量过滤）→ top-K → PG 读 L1 rerank
-对账: EmbeddingReconciler → repo.find_missing_embeddings() → EmbeddingClient.embed() → repo.update_embedding()
-```
-
-### Embedding 一致性保证
-
-pgvector 与内容存储在同一 PG 实例中，消除了跨系统双写的一致性问题。embedding 生成需调用外部 API，因此是标准写入路径中的异步步骤（非边缘场景）：内容先写入 PG，embedding 异步回填。
-
-`EmbeddingReconciler` 定时检测缺失的 embedding 并补写：
-
-```python
-class EmbeddingReconciler:
-    """定时检查：确保有 l0_content 的 active context 都有对应的 embedding"""
-
-    async def reconcile(self, account_id: str):
-        missing = await self.repo.fetch("""
-            SELECT id, l0_content FROM contexts
-            WHERE account_id = $1 AND status IN ('active', 'stale')
-              AND l0_content IS NOT NULL
-              AND l0_embedding IS NULL
-        """, account_id)
-
-        if missing:
-            logger.info(f"Backfilling {len(missing)} missing embeddings")
-            for row in missing:
-                embedding = await self.embed_fn(row['l0_content'])
-                await self.repo.execute(
-                    "UPDATE contexts SET l0_embedding = $1 WHERE id = $2",
-                    embedding, row['id'])
-```
-
-建议运行频率：每小时一次（可配置 `CTX_RECONCILE_INTERVAL_MINUTES=60`）。
-
----
-
-## 五、L0/L1 生成实现
-
-### 核心设计：ContentGenerator + Strategy 模式
+### 7.2 L0/L1 生成
 
 ```python
 class ContentGenerator:
-    """统一入口，根据 context_type 分派到对应策略"""
-    def __init__(self, llm: LLMClient):
-        self._strategies = {
-            "table_schema": TableSchemaStrategy(llm),
-            "skill":        SkillStrategy(),          # 无 LLM 依赖
-            "memory":       MemoryStrategy(llm),
-            "resource":     ResourceStrategy(llm),
-        }
+    async def generate(
+        self,
+        context_type: str,
+        raw_content: str,
+        metadata: dict,
+    ) -> GeneratedContent: ...
 
-    async def generate(self, context_type: str, raw_content: str, metadata: dict) -> GeneratedContent:
-        return await self._strategies[context_type].generate(raw_content, metadata)
 
 @dataclass
 class GeneratedContent:
-    l0: str                     # ~100 tokens
-    l1: str                     # ~2k tokens
-    llm_tokens_used: int        # 纯模板为 0
+    l0: str
+    l1: str
+    llm_tokens_used: int
 ```
 
-### 各类型生成策略
+| context_type | L0 生成 | L1 生成 | LLM 调用 |
+|---|---|---|---|
+| `table_schema` | DDL/注释 -> 一句话业务描述 | schema 表格 + 查询模式建议 | 是 |
+| `skill` | 标题 + 首句 | 全文截断 | 否 |
+| `memory` | 前 ~100 tokens | 短内容直接返回；超长压缩 | 通常否 |
+| `resource` | 一句话摘要 | 结构化概览 | 是 |
 
-| context_type | L0 生成 | L1 生成 | LLM 调用 | Token 消耗 |
-|---|---|---|---|---|
-| `table_schema` | LLM：DDL+字段注释 → 一句话业务描述 | 模板拼 schema 表格 + LLM 生成查询模式建议 | 是 | ~500 |
-| `skill` | 模板：提取 Markdown 标题 + 首句 | 模板：全文截断到 ~2k tokens | 否 | 0 |
-| `memory` | 模板：前 ~100 tokens 截取 | 短内容直接返回；超长才用 LLM 压缩 | 罕见 | 通常 0 |
-| `resource` | LLM：文档前 2000 字 → 一句话摘要 | LLM：生成结构化概览（主题/要点/适用场景） | 是 | ~1500 |
+### 7.3 Embedding 一致性
 
-### LLMClient ABC
+写入与对账流程：
 
-```python
-@dataclass
-class LLMResponse:
-    content: str
-    input_tokens: int
-    output_tokens: int
-    model: str
-
-class LLMClient(ABC):
-    @abstractmethod
-    async def complete(self, prompt: str, max_tokens: int = 512, temperature: float = 0.0) -> LLMResponse: ...
-
-    @abstractmethod
-    async def complete_batch(self, prompts: list[str], max_tokens: int = 512, max_concurrency: int = 10) -> list[LLMResponse]: ...
+```text
+write/promote/publish
+  -> contexts/change_events 落库
+  -> IndexerService 生成 L0/L1
+  -> EmbeddingClient 写回 l0_embedding
+  -> ReconcilerService 定时补写缺失 embedding
 ```
 
-### TableSchemaStrategy 关键设计
+`ReconcilerService` 虽是后台任务，但仍使用同一套 `repo.session(account_id)` 模型，不是全局 executor。
 
-L1 生成分两步，最大化确定性内容、最小化 LLM 调用：
-1. 模板拼接 schema 表格 + 分区信息 + 统计信息 + 样例数据（零 token）
-2. LLM 只生成"常用查询模式"段落（~200 input + ~200 output tokens）
+### 7.4 PropagationEngine
 
-### SkillStrategy 关键设计
+- `change_events` 是唯一 source of truth
+- `NOTIFY` 只是 wake-up hint
+- `start()` 后执行 `requeue_stuck_events()` + `sweep_ready_events(reason="startup")`
+- 周期补扫兜住漏通知和 crash 窗口
+- 单个依赖目标失败不阻塞其他目标，但 event 只要有失败就回到 `retry`
+- 所有副作用按 `(event_id, target_id, action)` 幂等
 
-完全不调用 LLM。Skill 本身是 Markdown 指令，截取比摘要更保真：
-- L0: 提取 `# 标题` + 正文首句
-- L1: 全文截断到 ~3000 字符，在段落边界截断
-
-### MemoryStrategy 关键设计
-
-大多数记忆 < 2k tokens，直接返回全文（零 LLM）：
-- L0: 前 ~100 tokens 截取
-- L1: 内容 <= 3000 字符直接返回；超长才用 LLM 压缩（罕见）
+MVP 阶段动作语义：
+- `mark_stale`：直接更新 `contexts.status='stale'`
+- `auto_update`：直接重算内容
+- `notify`：floating 订阅者下次读取自然获得 latest，不要求通知表
+- `advisory`：由 `SkillService.read_resolved()` 在 pinned 读取时返回
 
 ---
 
-## 六、实施顺序
+## 八、实施顺序
 
-按 Phase 实施，每个 Phase 内的文件创建顺序：
+### Phase 0（基础设施）
 
-### Phase 0（基础设施，1 天）
-0. `docker-compose.yml` + `Dockerfile` + `.env.example`
+1. `docker-compose.yml` + `Dockerfile` + `.env.example`
+2. `pyproject.toml` + `alembic.ini`
 
-### Phase 1（骨架，1-2 周）
-1. `pyproject.toml` + `alembic.ini`
-2. `config.py` + `models/` 全部
-3. `db/pool.py` + `db/repository.py`（含 RLS SET LOCAL 逻辑）+ `db/queries/`
-4. `alembic/versions/001_initial_schema.py`（所有核心表 + RLS + 索引）
-5. `llm/base.py` + `llm/openai_client.py` + `llm/factory.py`
-6. `generation/` 全部
-7. `retrieval/rerank.py`（KeywordRerankStrategy）
-8. `store/context_store.py`（含乐观锁、列名白名单）
-9. `services/acl_service.py` + `services/audit_service.py`
-10. `services/indexer_service.py`
-11. `api/deps.py` + `api/middleware.py`（含 RLS 中间件）+ `api/routers/contexts.py`
-12. `main.py`
+### Phase 1（MVP Core Foundation）
 
-### Phase 2A（数据湖，3-4 周）
-13. `connectors/base.py` + `connectors/mock_connector.py`
-14. `services/catalog_sync_service.py`
-15. `retrieval/router.py` + `retrieval/vector_strategy.py`
-16. `services/retrieval_service.py`
-17. `api/routers/datalake.py` + `api/routers/search.py`
+1. `config.py` + `models/context.py` + `models/request.py` + `models/team.py` + `models/skill.py` + `models/memory.py`
+2. `db/pool.py` + `db/repository.py`
+   - 实现 `PgRepository.session(account_id) -> ScopedRepo`
+   - 冻结 `SET LOCAL` 只在这里发生
+3. `alembic/versions/001_initial_schema.py`
+   - 仅包含 core + carrier-specific 需要的表
+   - 不包含 `access_policies`、`audit_log`、`context_feedback`、`lifecycle_policies`
+4. `services/acl_service.py`
+   - 只实现默认可见性 / 默认写权限
+5. `store/context_store.py`
+   - 只实现 `read/write/ls/stat`
+6. `api/middleware.py` + `api/deps.py` + `api/routers/contexts.py`
+   - middleware 只做认证 / `RequestContext`
+   - `get_db` 提供 request-scoped `ScopedRepo`
 
-### Phase 2B（多 Agent，3-4 周，与 2A 并行）
-18. `services/memory_service.py`（含 promote + approve/reject 预留接口）+ `services/skill_service.py`
-19. `api/routers/memories.py` + `api/routers/skills.py`
+### Phase 2（MVP 协作闭环）
 
-### Phase 2C（变更传播，2A+2B 之后）
-20. `propagation/` 全部
-21. `services/propagation_engine.py`（含全事件处理、错误隔离、单实例注释）
+1. `services/indexer_service.py`
+2. `services/memory_service.py`
+   - promote
+   - `derived_from` 注册
+3. `services/skill_service.py`
+   - publish / subscribe / `read_resolved`
+4. `services/retrieval_service.py` + `retrieval/`
+   - 唯一 search owner
+5. `propagation/` + `services/propagation_engine.py`
+   - startup sweep / periodic sweep / retry / recovery
+6. `api/routers/memories.py` + `api/routers/skills.py` + `api/routers/search.py` + `api/routers/tools.py`
+7. `sdk/` + `plugins/openclaw/`
+   - 只接 MVP 需要的 tools：`ls/read/grep/stat/store/promote/skill_publish`
 
-### Phase 2D（最小权限 + 运维）
-22. `services/acl_service.py` 补充 owner_space 多团队可见性检查（post-MVP）
-23. `services/reconciler_service.py`（EmbeddingReconciler）
+### Phase 3（Carrier-Specific）
 
-### Phase 2E（SDK + Plugin，与 2A/2B 并行）
-24. `sdk/` 全部
-25. `plugins/openclaw/` 全部
+1. `connectors/base.py` + `connectors/mock_connector.py`
+2. `services/catalog_sync_service.py`
+3. `api/routers/datalake.py`
+4. `/api/v1/search/sql-context`
+5. `services/reconciler_service.py`
+6. 企业数据分析 / Text-to-SQL demo
 
-### Phase 3（集成与评估，2 周）
-26. 两条线集成 + MVP 场景验证
-27. ECMB benchmark
+### Phase 4（Post-MVP Reserved）
+
+1. 显式 ACL allow/deny/mask
+2. 审计日志
+3. 反馈闭环
+4. 生命周期管理
+5. `feedback` / `admin` 路由
 
 ---
 
-## 七、验证方式
+## 九、验证方式
 
-1. Phase 1 完成后：`uvicorn contexthub.main:app` 启动，`POST /api/v1/contexts` 创建上下文，`GET` 读取
-2. Phase 2A 完成后：`POST /api/v1/datalake/sync` 同步 Mock 数据，`POST /api/v1/search` 语义检索
-3. Phase 2C 完成后：修改湖表 schema → 观察依赖方被标记 stale
-4. 全部完成后：跑通 MVP 场景（自然语言 → 上下文检索 → SQL 生成）
+1. **执行模型验证**
+   - 任一请求只创建一个 `ScopedRepo`
+   - middleware 中不存在 `SET LOCAL`
+   - 任一 service/store/helper 不自行开连接
+2. **MVP 闭环验证**
+   - 私有写入
+   - promote 到团队共享
+   - 另一个 Agent 检索并复用
+   - 发布 Skill 新版本
+   - 依赖方 stale / advisory
+   - 断开 LISTEN 或制造 lease 超时后最终恢复
+3. **载体验证**
+   - 数据湖元数据检索
+   - `sql-context` 组装
+   - 企业数据分析 demo
+
+本文档中的默认 MVP 场景不是“自然语言 → 检索 → SQL 生成”，而是横向协作闭环；SQL 生成只是首个垂直载体里的 demo。
 
 ---
 
-## 八、基础设施
+## 十、基础设施
 
-### Docker Compose（开发环境）
+### 10.1 初始 migration 要点
 
-```yaml
-# docker-compose.yml
-services:
-  postgres:
-    image: pgvector/pgvector:pg16
-    environment:
-      POSTGRES_USER: ctx
-      POSTGRES_PASSWORD: ctx
-      POSTGRES_DB: contexthub
-    ports:
-      - "5432:5432"
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ctx"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
-  contexthub:
-    build: .
-    ports:
-      - "8000:8000"
-    environment:
-      CTX_PG_DSN: postgresql://ctx:ctx@postgres:5432/contexthub
-      CTX_OPENAI_API_KEY: ${OPENAI_API_KEY}
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-volumes:
-  pg_data:
-```
-
-### Alembic Migration 要点
-
-`alembic/versions/001_initial_schema.py` 需包含：
-- 所有核心表（contexts, dependencies, change_events, table_metadata, lineage, table_relationships, query_templates, skill_versions, teams, team_memberships）
-- 长文档扩展：`ALTER TABLE contexts ADD COLUMN file_path TEXT`（可选，Phase 2 启用）
-- `document_sections` 表（可选，Phase 2 启用）
+`001_initial_schema.py` 必须包含：
+- `contexts`
+- `dependencies`
+- `change_events`
+- `teams`
+- `team_memberships`
+- `skill_versions`
+- `skill_subscriptions`
+- `table_metadata` / `lineage` / `table_relationships` / `query_templates`（若启用首个垂直载体）
 - RLS 策略 + 索引
+- `l0_embedding vector(1536)`
 
-### 认证中间件中的 RLS 设置
+初始 migration 明确不包含：
+- `access_policies`
+- `audit_log`
+- `context_feedback`
+- `lifecycle_policies`
+
+### 10.2 认证中间件
 
 ```python
-# api/middleware.py
 @app.middleware("http")
-async def set_rls_context(request: Request, call_next):
-    account_id = request.headers.get("X-Account-Id")
-    if account_id:
-        # 在请求级别设置 RLS 上下文
-        # PgRepository.acquire() 内部执行：
-        #   await conn.execute("SET LOCAL app.account_id = $1", account_id)
-        request.state.account_id = account_id
-    response = await call_next(request)
-    return response
+async def bind_request_context(request: Request, call_next):
+    request.state.api_key = request.headers.get("X-API-Key")
+    request.state.account_id = request.headers.get("X-Account-Id")
+    request.state.agent_id = request.headers.get("X-Agent-Id")
+    return await call_next(request)
 ```
+
+中间件职责只到这里为止。它不执行：
+- `SET LOCAL`
+- `BEGIN/COMMIT`
+- 任何 tenant-scoped SQL
+
+这些都只允许在 `PgRepository.session(account_id)` 内发生。

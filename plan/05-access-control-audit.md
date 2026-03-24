@@ -2,6 +2,21 @@
 
 ## 细粒度权限控制
 
+> **能力边界**：MVP 只实现默认可见性 / 默认写权限。本章是明确后置 backlog 的 owner 文档，定义 `access_policies`、字段脱敏与审计能力；触发条件与重开入口见 `14-adr-backlog-register.md`。
+
+### 默认访问基线（MVP）
+
+在引入显式 ACL 之前，系统先有一套默认访问基线：
+
+- **默认读权限**：来自 `scope` + 团队层级可见性。Agent 默认可读自己的私有空间、所属团队及其祖先团队、根团队共享内容，以及 `datalake` / 组织级 `resources`。
+- **默认写权限**：来自所有权与 `team_memberships`。Agent 只能写自己的私有空间，或自己所在团队有写权限的团队路径。
+- **跨团队共享**：MVP 只通过 `promote` 把内容写入目标团队路径或共同祖先路径来完成。
+- `dependencies` 只记录引用 / 来源 / 传播，本身不授予读权限。
+
+`access_policies` 是对这套默认基线的显式覆盖，而不是取代它的全局白名单系统。
+
+### `access_policies` 叠加层（post-MVP）
+
 权限策略存储在 PG `access_policies` 表中（定义见 01-storage-paradigm.md）：
 
 ```sql
@@ -20,9 +35,11 @@ account_id      TEXT         -- 租户隔离
 
 ```
 评估顺序（从高到低）：
-1. 显式 deny 优先（deny-override）：任何匹配的 deny 策略直接拒绝
-2. 同级冲突：多条 allow 策略匹配时，取 priority 最高的
-3. 无匹配策略：默认 deny（白名单模式）
+1. 先计算默认访问基线（可见性 / 所有权）
+2. 显式 deny 优先（deny-override）：任何匹配的 deny 策略直接拒绝
+3. 同级冲突：多条 allow 策略匹配时，取 priority 最高的
+4. 无匹配策略：回退到默认访问基线，而不是全局默认 deny
+5. 仅当最终结果允许 `read` 时，才应用 `field_masks`
 ```
 
 ### 评估实现（PG 查询）
@@ -40,6 +57,8 @@ ORDER BY
   priority DESC                                          -- 同类型按优先级排序
 LIMIT 1;
 ```
+
+上面这条 SQL 只是**策略查找**，不是最终判定。最终判定还需要把“默认访问基线”一起纳入。
 
 ### 与团队层级的交互
 
@@ -59,6 +78,9 @@ LIMIT 1;
 
 ```python
 async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool:
+    # 0. 先算默认访问基线（MVP 已有能力）
+    baseline_allowed = await self.visibility.check_default_access(uri, ctx, action)
+
     # 获取 agent 可见团队对应的路径链（如 ['engineering/backend', 'engineering', '']），供 principal = ANY($4)
     team_paths = await self.get_visible_team_paths(ctx.agent_id)
 
@@ -75,11 +97,11 @@ async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool
     # deny-override：任何 deny 直接拒绝
     if policies and policies[0]['effect'] == 'deny':
         return False
-    # 有 allow 则通过
+    # 有显式 allow 则通过（可授予默认不可见资源）
     if policies and policies[0]['effect'] == 'allow':
         return True
-    # 无匹配策略：默认 deny
-    return False
+    # 无匹配策略：回退到默认访问基线
+    return baseline_allowed
 ```
 
 `get_visible_team_paths` 的实现：由 `team_memberships` 得到 agent 所属 `team_id`，再对 `teams` 用 `parent_id` 做递归 CTE 向上遍历祖先，将每条 team 的路径片段拼成与 `principal` / `resource_uri_pattern` 对齐的字符串列表（不再依赖 `owner_space` 字符串劈分模拟层级）。
@@ -91,8 +113,8 @@ async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool
 
 流程：
   1. Retrieval Engine 从 PG 读取候选上下文
-  2. Auth & ACL 模块评估当前 Agent 的 AccessPolicy
-  3. 匹配到 field_masks → 在返回的 L1/L2 内容中替换对应字段为 [MASKED]
+  2. Auth & ACL 模块先做默认访问基线判定，再评估 AccessPolicy
+  3. 若最终允许 `read` 且命中 `field_masks` → 在返回的 L1/L2 内容中替换对应字段为 [MASKED]
   4. Agent 看到的是脱敏后的内容
 
 为什么不在存储层加密：
@@ -101,6 +123,8 @@ async def check_access(self, uri: str, ctx: RequestContext, action: str) -> bool
 ```
 
 ## 审计日志
+
+> 审计日志是 **post-MVP** 能力。MVP 阶段可先不落 `audit_log`，不影响共享 / 传播 / 可见性语义。
 
 审计日志存储在 PG `audit_log` 表中（定义见 01-storage-paradigm.md），利用 PG 的 ACID 保证审计记录与业务操作的一致性：
 

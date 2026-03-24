@@ -5,15 +5,23 @@
 | 范围 | URI 示例 | 可见性 | 写权限 |
 |------|----------|--------|--------|
 | Private | `ctx://agent/{agent_id}/` | 仅该 Agent | 该 Agent |
-| 子团队 | `ctx://team/engineering/backend/` | 该子团队成员 + 上级继承 | 子团队成员 |
-| 上级团队 | `ctx://team/engineering/` | 工程部所有成员 | 工程部管理员 |
+| 子团队 | `ctx://team/engineering/backend/` | backend 成员 | 子团队成员 |
+| 上级团队 | `ctx://team/engineering/` | engineering 成员及其子团队成员 | 工程部管理员 |
 | 根团队(=全组织) | `ctx://team/` | 所有 Agent | 组织管理员 |
 
 团队结构存储在 PG `teams` + `team_memberships` 表中（定义见 01-storage-paradigm.md），通过 `teams.parent_id` 递归 CTE 实现层级继承。
 
+> 继承方向为**子读父**：子团队成员可见祖先团队内容；父团队成员默认不能读取子团队内容。
+
 ## (b) Skill 版本管理（简化方案）
 
 Skill 本质是自然语言指令（Markdown），不是代码 API。SemVer 的"兼容性"概念在语义层面无法客观判定。因此不做自动兼容性判断，改为"版本号 + changelog + 手动标记 breaking"。
+
+### 版本不可变性原则（见 00a §6）
+
+- `published` 状态的版本行，其 `content`、`changelog`、`is_breaking` 字段**不可修改**。
+- `draft` 状态的版本可修改。`published → deprecated` 是允许的转换，但内容不变。
+- 通过 URI 读取 Skill 始终返回最新 `published` 版本。历史版本通过 API 参数 `?version=N` 读取。
 
 ### PG 表结构
 
@@ -21,20 +29,17 @@ Skill 本质是自然语言指令（Markdown），不是代码 API。SemVer 的"
 CREATE TABLE skill_versions (
     skill_id        UUID NOT NULL REFERENCES contexts(id),  -- Skill 对应 contexts 行
     version         INT NOT NULL,           -- 递增版本号
-    content         TEXT NOT NULL,          -- Skill 定义（Markdown）
-    changelog       TEXT,                   -- 变更说明（~50 tokens）
-    is_breaking     BOOLEAN DEFAULT FALSE,  -- 发布者手动标记
-    status          TEXT DEFAULT 'draft',   -- 'draft' | 'published' | 'deprecated'
+    content         TEXT NOT NULL,          -- Skill 定义（Markdown）；published 后不可变（见 00a §6.1）
+    changelog       TEXT,                   -- 变更说明（~50 tokens）；published 后不可变
+    is_breaking     BOOLEAN DEFAULT FALSE,  -- 发布者手动标记；published 后不可变
+    status          TEXT DEFAULT 'draft',   -- 'draft' | 'published' | 'deprecated'（见 00a §5.2）
     published_by    TEXT,                   -- 发布者 agent_id
     published_at    TIMESTAMPTZ,
     PRIMARY KEY (skill_id, version)
 );
 
--- skill_subscriptions 已合并到 dependencies 表（见 01-storage-paradigm.md）
--- 订阅通过 dep_type='skill_subscription' 表示：
---   dependent_id = <agent context UUID>（订阅者）
---   dependency_id = skill_id（被订阅的 Skill）
---   pinned_version = NULL（跟随 latest）或具体版本号
+-- 订阅关系存储在独立的 skill_subscriptions 表（见 01-storage-paradigm.md）
+-- 订阅主体是 agent（TEXT 标识），不是 context（UUID 行），因此不适合放在 dependencies 表中（见 00a §2.2, §6.4）
 ```
 
 ### 发布流程
@@ -63,40 +68,43 @@ async def publish_skill_version(self, skill_id: UUID, content: str,
 
         # 4. 发出变更事件（同一事务内）
         await self.pg.execute("""
-            INSERT INTO change_events (context_id, change_type, actor, new_version, metadata)
-            VALUES ($1, 'version_published', $2, $3, $4)
-        """, skill_id, ctx.agent_id, str(new_ver),
+            INSERT INTO change_events (context_id, account_id, change_type, actor, new_version, metadata)
+            VALUES ($1, $2, 'version_published', $3, $4, $5)
+        """, skill_id, ctx.account_id, ctx.agent_id, str(new_ver),
              json.dumps({"is_breaking": is_breaking, "changelog": changelog}))
 
-    # 5. 事务提交后触发传播（payload 为 Skill 的 context UUID）
-    await self.pg.execute("NOTIFY context_changed, $1", str(skill_id))
+    # 5. 事务提交后，change_events 的 AFTER INSERT trigger 自动发出 PG NOTIFY 'context_changed'
+    #    无需应用层手动调用（见 01-storage-paradigm.md trigger 定义）
 ```
 
-传播逻辑：
-- `is_breaking=True` → 依赖方被标记 STALE（见 06-change-propagation.md）
-- `is_breaking=False` → 仅通知订阅者，不标记 STALE
+传播逻辑（详见 06-change-propagation.md）：
+
+对 **使用依赖**（`dependencies` 表中 `dep_type='skill_version'` 的 artifact）：
+- `is_breaking=True` → artifact 被标记 STALE（它的内容是用旧版本生成的，可能已过时）
+- `is_breaking=False` → 仅通知，不标记 STALE
+
+对 **订阅者**（`skill_subscriptions` 表）：
+- floating 订阅者（`pinned_version IS NULL`）→ 收到通知（读取时自动拿到新版本）
+- pinned 订阅者（`pinned_version = N`）→ 收到 advisory 通知（"v3 已发布，你仍在 v2"），不被标记 STALE，读取时仍返回 pin 的版本（见 00a §6.2.2）
 
 ## (c) 记忆共享与提升
 
 ```
-Agent 私有记忆 → [提升请求] → 审核流程（可选） → 写入目标团队路径
-                                                    ↓
-                                        [该团队及子团队 Agent 收到通知]
+Agent 私有记忆 → promote → 写入目标团队路径
+                               ↓
+                    [目标团队及其子团队 Agent 可见]
 ```
 
-> **MVP 阶段**：跳过审核，直接写入。但预留审核接口（`review_status` 字段 + `approve/reject` API），后续可启用。
+> **Session 4 冻结结果**：MVP 的跨团队共享只走 `promote`。`dependencies` 负责记录 `derived_from` 来源与传播关系，但不单独授予跨团队读权限。更窄的“reference + ACL”共享方式被归入明确后置 backlog，触发条件与重开入口见 `14-adr-backlog-register.md`。
 
 ### 提升流程（PG 事务保证原子性）
 
-```python
-async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestContext,
-                          skip_review: bool = True):
-    """提升记忆到团队共享空间。
+> 下方伪码是 MVP 的 canonical promote 流。审核流和审计 hook 均不属于当前 MVP 主路径；如后续要加，只能作为后置叠加层插入这个流程之前或之后，不能改变当前共享语义，具体分流见 `14-adr-backlog-register.md`。
+> 真实代码中的 request-scoped `ScopedRepo` / `db` 执行模型以 `10-code-architecture.md` 为准；这里的伪码只表达业务事务边界。
 
-    Args:
-        skip_review: MVP 阶段默认 True（直接写入）。
-                     设为 False 时写入 review_status='pending'，等待审核通过后再激活。
-    """
+```python
+async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestContext):
+    """MVP canonical flow：直接将私有记忆提升到目标团队路径。"""
     async with self.pg.transaction():
         # 1. 读取源记忆
         source = await self.pg.fetchrow("SELECT * FROM contexts WHERE uri = $1", source_uri)
@@ -105,14 +113,13 @@ async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestCo
         target_uri = f"ctx://team/{target_team}/memories/shared_knowledge/{source['uri'].split('/')[-1]}"
 
         # 3. 写入目标团队路径，取得新行 id
-        initial_status = 'active' if skip_review else 'pending_review'
         promoted_id = await self.pg.fetchval("""
             INSERT INTO contexts (uri, context_type, scope, owner_space, account_id,
                 l0_content, l1_content, l2_content, status)
-            VALUES ($1, 'memory', 'team', $2, $3, $4, $5, $6, $7)
+            VALUES ($1, 'memory', 'team', $2, $3, $4, $5, $6, 'active')
             RETURNING id
         """, target_uri, target_team, ctx.account_id,
-             source['l0_content'], source['l1_content'], source['l2_content'], initial_status)
+             source['l0_content'], source['l1_content'], source['l2_content'])
 
         # 4. 注册 derived_from：提升后的记忆（dependent）依赖原始记忆（dependency），便于来源追踪与变更传播
         await self.pg.execute("""
@@ -122,44 +129,15 @@ async def promote_memory(self, source_uri: str, target_team: str, ctx: RequestCo
 
         # 5. 发出变更事件
         await self.pg.execute("""
-            INSERT INTO change_events (context_id, change_type, actor, metadata)
-            VALUES ($1, 'created', $2, $3)
-        """, promoted_id, ctx.agent_id,
-             json.dumps({"promoted_from": source_uri, "review_status": initial_status}))
-
-        # 6. 审计日志
-        await self.pg.execute("""
-            INSERT INTO audit_log (actor, action, resource_uri, metadata)
-            VALUES ($1, 'promote', $2, $3)
-        """, ctx.agent_id, target_uri, json.dumps({"from": source_uri, "to_team": target_team}))
-
-async def approve_promotion(self, uri: str, ctx: RequestContext):
-    """审核通过：将 pending_review 状态的记忆激活。预留接口，MVP 阶段不调用。"""
-    async with self.pg.transaction():
-        await self.pg.execute("""
-            UPDATE contexts SET status = 'active', updated_at = NOW()
-            WHERE uri = $1 AND status = 'pending_review'
-        """, uri)
-        await self.pg.execute("""
-            INSERT INTO audit_log (actor, action, resource_uri, metadata)
-            VALUES ($1, 'approve_promotion', $2, '{}')
-        """, ctx.agent_id, uri)
-    ctx_id = await self.pg.fetchval("SELECT id FROM contexts WHERE uri = $1", uri)
-    await self.pg.execute("NOTIFY context_changed, $1", str(ctx_id))
-
-async def reject_promotion(self, uri: str, reason: str, ctx: RequestContext):
-    """审核拒绝：删除 pending_review 状态的记忆。预留接口，MVP 阶段不调用。"""
-    async with self.pg.transaction():
-        rejected_id = await self.pg.fetchval(
-            "SELECT id FROM contexts WHERE uri = $1 AND status = 'pending_review'", uri)
-        if rejected_id:
-            await self.pg.execute("DELETE FROM dependencies WHERE dependent_id = $1", rejected_id)
-        await self.pg.execute("DELETE FROM contexts WHERE uri = $1 AND status = 'pending_review'", uri)
-        await self.pg.execute("""
-            INSERT INTO audit_log (actor, action, resource_uri, metadata)
-            VALUES ($1, 'reject_promotion', $2, $3)
-        """, ctx.agent_id, uri, json.dumps({"reason": reason}))
+            INSERT INTO change_events (context_id, account_id, change_type, actor, metadata)
+            VALUES ($1, $2, 'created', $3, $4)
+        """, promoted_id, ctx.account_id, ctx.agent_id,
+             json.dumps({"promoted_from": source_uri}))
 ```
+
+后置扩展说明（已分流到 `14-adr-backlog-register.md`）：
+- 如未来需要审核流，可在 `promote` 前增加 `pending_review` 状态和 `approve/reject` 路由，但它们不属于当前 MVP canonical path。
+- 如未来需要审计日志，可在同一事务中追加 `audit_log` 写入，但它不应成为 promote 语义成立的前提。
 
 示例：后端组 Agent 的一个 SQL pattern 提升到工程部共享
 ```
