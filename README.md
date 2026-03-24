@@ -2,6 +2,8 @@
 
 **Enterprise context management middleware for multi-agent collaboration.**
 
+English | [中文](README_zh.md)
+
 When multiple AI agents operate on the same business entities, their contexts — memories, skills, policies, schemas — are siloed, unversioned, and disconnected. Research shows **79% of multi-agent failures stem from coordination problems, not technical bugs**. ContextHub solves this with a unified context state layer.
 
 ## Why ContextHub
@@ -183,4 +185,4 @@ contexthub/
 
 ## License
 
-TBD
+[Apache License 2.0](LICENSE)
