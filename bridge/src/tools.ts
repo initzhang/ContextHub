@@ -77,20 +77,18 @@ export function createContextHubTools(bridge: ContextHubBridge) {
     makeTool(
       bridge,
       "contexthub_store",
-      "Write or update a context in ContextHub.",
+      "Store a private memory for future recall. Use when the user asks you to remember, save, or note down information.",
       {
         type: "object",
         properties: {
-          uri: { type: "string", description: "Context URI to write" },
-          content: { type: "string", description: "Content to store" },
-          context_type: {
-            type: "string",
-            enum: ["memory", "knowledge", "skill", "meta", "carrier"],
+          content: { type: "string", description: "Memory content to store" },
+          tags: {
+            type: "array",
+            items: { type: "string" },
+            description: "Optional tags for categorization",
           },
-          scope: { type: "string", enum: ["private", "team", "global"] },
-          tags: { type: "array", items: { type: "string" } },
         },
-        required: ["uri", "content"],
+        required: ["content"],
       },
     ),
 

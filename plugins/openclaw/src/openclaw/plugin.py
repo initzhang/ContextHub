@@ -19,6 +19,15 @@ _MAX_CAPTURE_CHARS = 600
 _ESTIMATED_CHARS_PER_TOKEN = 4
 _MESSAGE_OVERHEAD_TOKENS = 4
 _RECALL_HEADER = "## ContextHub Auto-Recall"
+_TOOL_GUIDE = """\
+## ContextHub Tools Guide
+- When the user asks you to **remember**, **save**, or **note down** information, \
+call `contexthub_store` with the content.
+- When the user asks to **share** or **promote** a memory to a team, \
+call `contexthub_promote` with the memory URI and target team name.
+- To **list** stored memories or shared knowledge, call `ls` with a URI prefix \
+(e.g. `ctx://agent/<agent_id>/memories` or `ctx://team/<team>/shared_knowledge`).
+- To **search** for relevant context, call `grep` with a keyword or question."""
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _SEGMENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _REUSABLE_HINTS = (
@@ -80,19 +89,26 @@ class ContextHubContextEngine:
         messages: list[dict[str, Any]],
         tokenBudget: int | None = None,
     ) -> dict[str, Any]:
-        """Inject auto-recall results via systemPromptAddition."""
+        """Inject tool guide + auto-recall results via systemPromptAddition."""
         message_tokens = self._estimate_message_tokens(messages)
+        guide_tokens = self._estimate_text_tokens(_TOOL_GUIDE)
+
         recall_budget = None
         if tokenBudget is not None:
-            recall_budget = max(tokenBudget - message_tokens, 0)
+            recall_budget = max(tokenBudget - message_tokens - guide_tokens, 0)
 
         recall_text = await self._auto_recall(messages, max_tokens=recall_budget)
         recall_tokens = self._estimate_text_tokens(recall_text or "")
 
+        addition_parts = [_TOOL_GUIDE]
+        if recall_text:
+            addition_parts.append(recall_text)
+        system_addition = "\n\n".join(addition_parts)
+
         return {
             "messages": messages,
-            "estimatedTokens": message_tokens + recall_tokens,
-            "systemPromptAddition": recall_text,
+            "estimatedTokens": message_tokens + guide_tokens + recall_tokens,
+            "systemPromptAddition": system_addition,
         }
 
     async def _auto_recall(
