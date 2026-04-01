@@ -3,7 +3,7 @@
 **Unified context governance middleware for enterprise multi-agent systems.**
 
 <div align="center">
-<img src="figures/logo.png" width="500">
+<img src="figures/logo2.jpeg" width="300">
 </div>
 
 English | [中文](README_zh.md)

@@ -3,7 +3,7 @@
 **面向企业多 Agent 协作的统一上下文治理中间件。**
 
 <div align="center">
-<img src="figures/logo.png" width="500">
+<img src="figures/logo2.jpeg" width="300">
 </div>
 
 [English](README.md) | 中文
