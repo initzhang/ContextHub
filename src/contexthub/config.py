@@ -2,6 +2,8 @@ from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from contexthub.db.compat import DatabaseBackend, DatabaseDialect
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -11,11 +13,14 @@ def _normalize_postgres_url(url: str) -> str:
         return "postgresql://" + url.removeprefix("postgresql+asyncpg://")
     if url.startswith("postgres://"):
         return "postgresql://" + url.removeprefix("postgres://")
+    if url.startswith("opengauss://"):
+        return "postgresql://" + url.removeprefix("opengauss://")
     return url
 
 
 class Settings(BaseSettings):
     database_url: str = "postgresql://contexthub:contexthub@localhost:5432/contexthub"
+    db_backend: DatabaseBackend = DatabaseBackend.POSTGRES
     api_key: str = "changeme"
     embedding_model: str = "text-embedding-3-small"
     propagation_enabled: bool = True
@@ -32,6 +37,10 @@ class Settings(BaseSettings):
         env_file=PROJECT_ROOT / ".env",
         env_file_encoding="utf-8",
     )
+
+    @property
+    def dialect(self) -> DatabaseDialect:
+        return DatabaseDialect(self.db_backend)
 
     @property
     def asyncpg_database_url(self) -> str:

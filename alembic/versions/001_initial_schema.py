@@ -6,7 +6,9 @@ Create Date: 2025-03-24
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import context, op
+
+from contexthub.db.compat import DatabaseBackend, DatabaseDialect
 
 revision: str = "001"
 down_revision: Union[str, None] = None
@@ -14,10 +16,19 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _get_dialect() -> DatabaseDialect:
+    cfg = context.config
+    return getattr(cfg.attributes, "dialect", None) or cfg.attributes.get(
+        "dialect", DatabaseDialect(DatabaseBackend.POSTGRES)
+    )
+
+
 def upgrade() -> None:
+    dialect = _get_dialect()
+
     # Extensions
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    op.execute(dialect.create_vector_extension_sql())
+    op.execute(dialect.create_uuid_extension_sql())
 
     # --- contexts ---
     op.execute("""
@@ -57,11 +68,9 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_contexts_scope ON contexts (scope, context_type)")
     op.execute("CREATE INDEX idx_contexts_owner ON contexts (account_id, owner_space)")
     op.execute("CREATE INDEX idx_contexts_status ON contexts (status) WHERE status != 'deleted'")
-    op.execute("""
-    CREATE INDEX idx_contexts_l0_embedding ON contexts
-        USING hnsw (l0_embedding vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-    """)
+    op.execute(dialect.hnsw_index_sql(
+        "idx_contexts_l0_embedding", "contexts", "l0_embedding",
+    ))
 
     # --- dependencies ---
     op.execute("""
@@ -111,14 +120,7 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_events_context ON change_events (context_id)")
 
     # --- change_events trigger ---
-    op.execute("""
-    CREATE OR REPLACE FUNCTION notify_change_event() RETURNS trigger AS $$
-    BEGIN
-        PERFORM pg_notify('context_changed', NEW.context_id::text);
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql
-    """)
+    op.execute(dialect.notify_trigger_function_sql())
     op.execute("""
     CREATE TRIGGER trg_change_events_notify
     AFTER INSERT ON change_events

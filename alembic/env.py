@@ -25,6 +25,9 @@ config.set_main_option(
     settings.sqlalchemy_database_url.replace("%", "%%"),
 )
 
+# Expose the dialect so migration scripts can adapt DDL per backend.
+config.attributes["dialect"] = settings.dialect
+
 
 def run_migrations_offline() -> None:
     url = config.get_main_option("sqlalchemy.url")

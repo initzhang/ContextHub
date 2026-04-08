@@ -10,7 +10,7 @@ Agents navigate memories, skills, documents, and data-lake metadata through fami
 (`ls`, `read`, `grep`, `stat`) over `ctx://` URIs — with version control, visibility boundaries,
 change propagation, and cross-agent sharing.
 
-Built on FastAPI + PostgreSQL. Single database. No external vector store. No message queue.
+Built on FastAPI + PostgreSQL/openGauss. Single database. No external vector store. No message queue.
 
 English | [中文](README_zh.md)
 </div>
@@ -50,7 +50,7 @@ All four are managed under a unified `ctx://` URI namespace with the same versio
 | **Change Propagation** | Upstream changes auto-notify all downstream dependents — no polling, no "latest version wins" |
 | **L0/L1/L2 Layered Retrieval** | Vector search → BM25 rerank → on-demand full content; **60–80% token reduction** vs. flat retrieval |
 | **Tenant Isolation** | Row-Level Security on all tables; request-scoped tenant binding |
-| **PostgreSQL-centric Single DB** | ACID + RLS + LISTEN/NOTIFY + pgvector in one database; no dual-write, no message queue |
+| **Single DB (PostgreSQL / openGauss)** | ACID + RLS + LISTEN/NOTIFY + pgvector in one database; no dual-write, no message queue. Supports both PostgreSQL and openGauss backends via `DB_BACKEND` config |
 
 ## Architecture 🏛️
 
@@ -79,7 +79,7 @@ All four are managed under a unified `ctx://` URI namespace with the same versio
 ### Prerequisites
 
 - **Python 3.12+**
-- **PostgreSQL 16** with **pgvector** extension
+- **PostgreSQL 16** with **pgvector** extension, **or openGauss 5.0+** with **pgvector** extension
 
 ### Step 1: Install PostgreSQL + pgvector
 
@@ -141,6 +141,27 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 ```
 
 > `SUPERUSER` is required because the schema uses `FORCE ROW LEVEL SECURITY`. This is fine for local development.
+
+### Alternative: Using openGauss
+
+<details>
+<summary><strong>Docker (openGauss)</strong></summary>
+
+```bash
+docker compose --profile opengauss up -d opengauss
+```
+
+Then configure the connection:
+
+```bash
+# .env
+DATABASE_URL=postgresql://contexthub:Contexthub@123@localhost:15432/contexthub
+DB_BACKEND=opengauss
+```
+
+> openGauss uses port **15432** in docker-compose to avoid conflict with a local PostgreSQL.
+
+</details>
 
 ### Step 3: Install & Start ContextHub
 
