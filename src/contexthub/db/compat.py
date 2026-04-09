@@ -2,6 +2,14 @@
 
 Abstracts SQL dialect differences between PostgreSQL and openGauss,
 allowing the rest of the application to remain backend-agnostic.
+
+Key differences handled here:
+- PostgreSQL uses **pgvector** extension (``CREATE EXTENSION vector``).
+  openGauss 6.x uses its own **DataVec** extension (``CREATE EXTENSION datavec``);
+  openGauss 7.0+ ships DataVec as a built-in kernel feature, so no
+  ``CREATE EXTENSION`` is needed at all for vector types.
+- PostgreSQL uses ``pgcrypto`` for ``gen_random_uuid()``.
+  openGauss uses ``uuid-ossp``.
 """
 
 from __future__ import annotations
@@ -32,8 +40,22 @@ class DatabaseDialect:
     # Extension management
     # ------------------------------------------------------------------
 
-    def create_vector_extension_sql(self) -> str:
-        return "CREATE EXTENSION IF NOT EXISTS vector"
+    def create_vector_extension_sql(self) -> str | None:
+        """SQL to enable vector types.
+
+        - PostgreSQL: ``CREATE EXTENSION IF NOT EXISTS vector`` (pgvector).
+        - openGauss 6.x: ``CREATE EXTENSION IF NOT EXISTS datavec``.
+        - openGauss 7.0+: vector types are built into the kernel — returns
+          the ``datavec`` command which is a harmless no-op if the type
+          is already present, and ensures 6.x compatibility.
+
+        Returns *None* only when absolutely no command is needed (reserved
+        for future use); callers should skip execution when *None*.
+        """
+        if self.is_postgres:
+            return "CREATE EXTENSION IF NOT EXISTS vector"
+        # openGauss: DataVec extension (6.x needs it; 7.0+ tolerates it)
+        return "CREATE EXTENSION IF NOT EXISTS datavec"
 
     def create_uuid_extension_sql(self) -> str:
         if self.is_postgres:

@@ -27,7 +27,9 @@ def upgrade() -> None:
     dialect = _get_dialect()
 
     # Extensions
-    op.execute(dialect.create_vector_extension_sql())
+    vector_ext_sql = dialect.create_vector_extension_sql()
+    if vector_ext_sql:
+        op.execute(vector_ext_sql)
     op.execute(dialect.create_uuid_extension_sql())
 
     # --- contexts ---
