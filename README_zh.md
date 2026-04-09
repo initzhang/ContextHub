@@ -79,7 +79,7 @@ Agent 通过熟悉的文件操作（`ls`、`read`、`grep`、`stat`）经由 `ct
 ### 前置条件
 
 - **Python 3.12+**
-- **PostgreSQL 16** + **pgvector** 扩展，**或 openGauss 5.0+** + **pgvector** 扩展
+- **PostgreSQL 16** + **pgvector** 扩展，**或 openGauss 7.0+**（DataVec 向量引擎已内置）
 
 ### 第 1 步：安装 PostgreSQL + pgvector
 
@@ -135,14 +135,18 @@ psql postgres
 CREATE USER contexthub WITH PASSWORD 'contexthub' SUPERUSER;
 CREATE DATABASE contexthub OWNER contexthub;
 \c contexthub
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS vector;    -- pgvector
+CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- 用于 gen_random_uuid()
 \q
 ```
 
 > 需要 `SUPERUSER` 权限，因为 schema 使用了 `FORCE ROW LEVEL SECURITY`。本地开发环境无安全问题。
 
 ### 备选方案：使用 openGauss
+
+需要 **openGauss 7.0+**。DataVec 向量引擎（等价于 pgvector）和 `uuid-ossp` 扩展已内置于内核——向量类型无需额外安装扩展。
+
+> **注意：** openGauss 不提供 `gen_random_uuid()` 函数（这是 PostgreSQL 13+ 的内置函数）。当 `DB_BACKEND=opengauss` 时，迁移脚本会自动使用 `uuid-ossp` 扩展的 `uuid_generate_v4()` 替代。
 
 <details>
 <summary><strong>Docker (openGauss)</strong></summary>

@@ -5,11 +5,13 @@ allowing the rest of the application to remain backend-agnostic.
 
 Key differences handled here:
 - PostgreSQL uses **pgvector** extension (``CREATE EXTENSION vector``).
-  openGauss 6.x uses its own **DataVec** extension (``CREATE EXTENSION datavec``);
-  openGauss 7.0+ ships DataVec as a built-in kernel feature, so no
-  ``CREATE EXTENSION`` is needed at all for vector types.
-- PostgreSQL uses ``pgcrypto`` for ``gen_random_uuid()``.
-  openGauss uses ``uuid-ossp``.
+  openGauss 7.0+ ships **DataVec** as a built-in kernel feature — the
+  ``vector`` type, ``<=>`` operator, and HNSW indexes work out of the box
+  without any ``CREATE EXTENSION``.
+- PostgreSQL provides ``gen_random_uuid()`` (built-in since PG 13, or via
+  ``pgcrypto``).  openGauss (based on PG 9.2 kernel) does **not** have
+  ``gen_random_uuid()``; use ``uuid_generate_v4()`` from ``uuid-ossp``
+  instead.
 """
 
 from __future__ import annotations
@@ -44,33 +46,41 @@ class DatabaseDialect:
         """SQL to enable vector types.
 
         - PostgreSQL: ``CREATE EXTENSION IF NOT EXISTS vector`` (pgvector).
-        - openGauss 6.x: ``CREATE EXTENSION IF NOT EXISTS datavec``.
-        - openGauss 7.0+: vector types are built into the kernel — returns
-          the ``datavec`` command which is a harmless no-op if the type
-          is already present, and ensures 6.x compatibility.
-
-        Returns *None* only when absolutely no command is needed (reserved
-        for future use); callers should skip execution when *None*.
+        - openGauss 7.0+: DataVec is a built-in kernel feature — no
+          ``CREATE EXTENSION`` is needed.  Returns *None* so callers can
+          skip execution.
         """
         if self.is_postgres:
             return "CREATE EXTENSION IF NOT EXISTS vector"
-        # openGauss: DataVec extension (6.x needs it; 7.0+ tolerates it)
-        return "CREATE EXTENSION IF NOT EXISTS datavec"
+        # openGauss 7.0+: vector types are built into the kernel.
+        return None
 
     def create_uuid_extension_sql(self) -> str:
+        """SQL to enable UUID generation functions.
+
+        - PostgreSQL: ``pgcrypto`` provides ``gen_random_uuid()``.
+        - openGauss: ``uuid-ossp`` provides ``uuid_generate_v4()``.
+          ``gen_random_uuid()`` is **not** available in openGauss because
+          its kernel is based on PostgreSQL 9.2 (the function was added in
+          PG 13).
+        """
         if self.is_postgres:
             return "CREATE EXTENSION IF NOT EXISTS pgcrypto"
-        return "CREATE EXTENSION IF NOT EXISTS uuid-ossp"
+        return 'CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'
 
     # ------------------------------------------------------------------
     # UUID generation
     # ------------------------------------------------------------------
 
     def uuid_generate_default(self) -> str:
-        """SQL DEFAULT expression for a UUID primary key."""
+        """SQL DEFAULT expression for a UUID primary key.
+
+        - PostgreSQL: ``gen_random_uuid()``
+        - openGauss: ``uuid_generate_v4()`` (from uuid-ossp extension)
+        """
         if self.is_postgres:
             return "gen_random_uuid()"
-        return "gen_random_uuid()"
+        return "uuid_generate_v4()"
 
     # ------------------------------------------------------------------
     # Vector index

@@ -31,6 +31,9 @@ class TestDatabaseDialectPostgres:
     def test_uuid_extension(self, dialect):
         assert "pgcrypto" in dialect.create_uuid_extension_sql()
 
+    def test_uuid_default_uses_gen_random_uuid(self, dialect):
+        assert dialect.uuid_generate_default() == "gen_random_uuid()"
+
     def test_vector_extension_uses_pgvector(self, dialect):
         sql = dialect.create_vector_extension_sql()
         assert sql is not None
@@ -71,12 +74,14 @@ class TestDatabaseDialectOpenGauss:
         assert dialect.is_postgres is False
 
     def test_uuid_extension(self, dialect):
-        assert "uuid-ossp" in dialect.create_uuid_extension_sql()
+        sql = dialect.create_uuid_extension_sql()
+        assert "uuid-ossp" in sql
 
-    def test_vector_extension_uses_datavec(self, dialect):
-        sql = dialect.create_vector_extension_sql()
-        assert sql is not None
-        assert "datavec" in sql
+    def test_uuid_default_uses_uuid_generate_v4(self, dialect):
+        assert dialect.uuid_generate_default() == "uuid_generate_v4()"
+
+    def test_vector_extension_is_none_builtin(self, dialect):
+        assert dialect.create_vector_extension_sql() is None
 
     def test_hnsw_index(self, dialect):
         sql = dialect.hnsw_index_sql("idx_test", "my_table", "embedding_col")

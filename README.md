@@ -79,7 +79,7 @@ All four are managed under a unified `ctx://` URI namespace with the same versio
 ### Prerequisites
 
 - **Python 3.12+**
-- **PostgreSQL 16** with **pgvector** extension, **or openGauss 5.0+** with **pgvector** extension
+- **PostgreSQL 16** with **pgvector** extension, **or openGauss 7.0+** (DataVec vector engine is built-in)
 
 ### Step 1: Install PostgreSQL + pgvector
 
@@ -135,14 +135,18 @@ Inside the `psql` shell:
 CREATE USER contexthub WITH PASSWORD 'contexthub' SUPERUSER;
 CREATE DATABASE contexthub OWNER contexthub;
 \c contexthub
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS vector;    -- pgvector
+CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- for gen_random_uuid()
 \q
 ```
 
 > `SUPERUSER` is required because the schema uses `FORCE ROW LEVEL SECURITY`. This is fine for local development.
 
 ### Alternative: Using openGauss
+
+Requires **openGauss 7.0+**. The DataVec vector engine (equivalent to pgvector) and `uuid-ossp` extension are built into the kernel — no extra extension installation is needed for vector types.
+
+> **Note:** openGauss does not provide `gen_random_uuid()` (a PostgreSQL 13+ built-in). The migration scripts automatically use `uuid_generate_v4()` from the `uuid-ossp` extension when `DB_BACKEND=opengauss`.
 
 <details>
 <summary><strong>Docker (openGauss)</strong></summary>

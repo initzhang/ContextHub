@@ -26,6 +26,8 @@ def _get_dialect() -> DatabaseDialect:
 def upgrade() -> None:
     dialect = _get_dialect()
 
+    uuid_default = dialect.uuid_generate_default()
+
     # Extensions
     vector_ext_sql = dialect.create_vector_extension_sql()
     if vector_ext_sql:
@@ -33,9 +35,9 @@ def upgrade() -> None:
     op.execute(dialect.create_uuid_extension_sql())
 
     # --- contexts ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE contexts (
-        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id              UUID PRIMARY KEY DEFAULT {uuid_default},
         uri             TEXT NOT NULL,
         context_type    TEXT NOT NULL CHECK (context_type IN ('table_schema', 'skill', 'memory', 'resource')),
         scope           TEXT NOT NULL CHECK (scope IN ('datalake', 'team', 'agent', 'user')),
@@ -90,9 +92,9 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_deps_dependent ON dependencies (dependent_id)")
 
     # --- change_events (no RLS) ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE change_events (
-        event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id        UUID PRIMARY KEY DEFAULT {uuid_default},
         timestamp       TIMESTAMPTZ DEFAULT NOW(),
         context_id      UUID NOT NULL REFERENCES contexts(id),
         account_id      TEXT NOT NULL,
@@ -130,9 +132,9 @@ def upgrade() -> None:
     """)
 
     # --- teams ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE teams (
-        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id          UUID PRIMARY KEY DEFAULT {uuid_default},
         path        TEXT NOT NULL,
         parent_id   UUID REFERENCES teams(id),
         display_name TEXT,
