@@ -10,5 +10,19 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  opengauss:
+    image: opengauss/opengauss:latest
+    ports:
+      - "15432:5432"
+    environment:
+      GS_DB: contexthub
+      GS_USERNAME: contexthub
+      GS_PASSWORD: "Contexthub@123"
+    volumes:
+      - ogdata:/var/lib/opengauss/data
+    profiles:
+      - opengauss
+
 volumes:
   pgdata:
+  ogdata:

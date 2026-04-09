@@ -7,6 +7,7 @@ from datetime import timedelta
 
 import asyncpg
 
+from contexthub.db.compat import DatabaseDialect
 from contexthub.db.repository import PgRepository, ScopedRepo
 from contexthub.propagation.base import PropagationAction
 from contexthub.propagation.registry import PropagationRuleRegistry
@@ -36,6 +37,7 @@ class PropagationEngine:
         indexer: IndexerService,
         sweep_interval: int = 30,
         lease_timeout: int = 300,
+        dialect: DatabaseDialect | None = None,
     ):
         self._repo = repo
         self._pool = pool
@@ -44,6 +46,7 @@ class PropagationEngine:
         self._indexer = indexer
         self._sweep_interval = sweep_interval
         self._lease_timeout = lease_timeout
+        self._dialect = dialect
         self._listen_conn: asyncpg.Connection | None = None
         self._drain_task: asyncio.Task | None = None
         self._ticker_task: asyncio.Task | None = None

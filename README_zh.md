@@ -10,7 +10,7 @@ Agent 通过熟悉的文件操作（`ls`、`read`、`grep`、`stat`）经由 `ct
 导航和管理记忆、技能、文档和数据湖元数据——
 具备版本控制、可见性边界、变更传播和跨 Agent 共享能力。
 
-基于 FastAPI + PostgreSQL 构建。单数据库。无外部向量库。无消息队列。
+基于 FastAPI + PostgreSQL/openGauss 构建。单数据库。无外部向量库。无消息队列。
 
 [English](README.md) | 中文
 </div>
@@ -50,7 +50,7 @@ Agent 通过熟悉的文件操作（`ls`、`read`、`grep`、`stat`）经由 `ct
 | **变更传播** | 上游变更自动通知所有下游依赖方——无需轮询，不是"最新版覆盖一切" |
 | **L0/L1/L2 分层检索** | 向量检索 → BM25 精排 → 按需加载完整内容；相比平坦检索**节省 60–80% token** |
 | **租户隔离** | 所有表启用行级安全（RLS）；请求级租户绑定 |
-| **PostgreSQL 单库架构** | ACID + RLS + LISTEN/NOTIFY + pgvector 集于一库；无双写、无消息队列 |
+| **单库架构（PostgreSQL / openGauss）** | ACID + RLS + LISTEN/NOTIFY + pgvector 集于一库；无双写、无消息队列。通过 `DB_BACKEND` 配置支持 PostgreSQL 和 openGauss 两种后端 |
 
 ## 架构 🏛️
 
@@ -79,7 +79,7 @@ Agent 通过熟悉的文件操作（`ls`、`read`、`grep`、`stat`）经由 `ct
 ### 前置条件
 
 - **Python 3.12+**
-- **PostgreSQL 16** + **pgvector** 扩展
+- **PostgreSQL 16** + **pgvector** 扩展，**或 openGauss 7.0+**（DataVec 向量引擎已内置）
 
 ### 第 1 步：安装 PostgreSQL + pgvector
 
@@ -135,12 +135,37 @@ psql postgres
 CREATE USER contexthub WITH PASSWORD 'contexthub' SUPERUSER;
 CREATE DATABASE contexthub OWNER contexthub;
 \c contexthub
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE EXTENSION IF NOT EXISTS vector;    -- pgvector
+CREATE EXTENSION IF NOT EXISTS pgcrypto;  -- 用于 gen_random_uuid()
 \q
 ```
 
 > 需要 `SUPERUSER` 权限，因为 schema 使用了 `FORCE ROW LEVEL SECURITY`。本地开发环境无安全问题。
+
+### 备选方案：使用 openGauss
+
+需要 **openGauss 7.0+**。DataVec 向量引擎（等价于 pgvector）和 `uuid-ossp` 扩展已内置于内核——向量类型无需额外安装扩展。
+
+> **注意：** openGauss 不提供 `gen_random_uuid()` 函数（这是 PostgreSQL 13+ 的内置函数）。当 `DB_BACKEND=opengauss` 时，迁移脚本会自动使用 `uuid-ossp` 扩展的 `uuid_generate_v4()` 替代。
+
+<details>
+<summary><strong>Docker (openGauss)</strong></summary>
+
+```bash
+docker compose --profile opengauss up -d opengauss
+```
+
+然后配置连接：
+
+```bash
+# .env
+DATABASE_URL=postgresql://contexthub:Contexthub@123@localhost:15432/contexthub
+DB_BACKEND=opengauss
+```
+
+> openGauss 在 docker-compose 中使用端口 **15432**，避免与本地 PostgreSQL 冲突。
+
+</details>
 
 ### 第 3 步：安装并启动 ContextHub
 

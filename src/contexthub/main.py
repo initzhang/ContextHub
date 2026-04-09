@@ -68,6 +68,7 @@ async def lifespan(app: FastAPI):
         )
 
         app.state.settings = settings
+        app.state.dialect = settings.dialect
         app.state.repo = repo
         app.state.acl_service = acl_service
         app.state.context_store = context_store
@@ -101,6 +102,7 @@ async def lifespan(app: FastAPI):
             indexer=indexer_service,
             sweep_interval=settings.propagation_sweep_interval,
             lease_timeout=settings.propagation_lease_timeout,
+            dialect=settings.dialect,
         )
 
         if settings.propagation_enabled:

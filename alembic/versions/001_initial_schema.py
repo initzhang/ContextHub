@@ -6,7 +6,9 @@ Create Date: 2025-03-24
 """
 from typing import Sequence, Union
 
-from alembic import op
+from alembic import context, op
+
+from contexthub.db.compat import DatabaseBackend, DatabaseDialect
 
 revision: str = "001"
 down_revision: Union[str, None] = None
@@ -14,15 +16,28 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _get_dialect() -> DatabaseDialect:
+    cfg = context.config
+    return getattr(cfg.attributes, "dialect", None) or cfg.attributes.get(
+        "dialect", DatabaseDialect(DatabaseBackend.POSTGRES)
+    )
+
+
 def upgrade() -> None:
+    dialect = _get_dialect()
+
+    uuid_default = dialect.uuid_generate_default()
+
     # Extensions
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    vector_ext_sql = dialect.create_vector_extension_sql()
+    if vector_ext_sql:
+        op.execute(vector_ext_sql)
+    op.execute(dialect.create_uuid_extension_sql())
 
     # --- contexts ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE contexts (
-        id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id              UUID PRIMARY KEY DEFAULT {uuid_default},
         uri             TEXT NOT NULL,
         context_type    TEXT NOT NULL CHECK (context_type IN ('table_schema', 'skill', 'memory', 'resource')),
         scope           TEXT NOT NULL CHECK (scope IN ('datalake', 'team', 'agent', 'user')),
@@ -57,11 +72,9 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_contexts_scope ON contexts (scope, context_type)")
     op.execute("CREATE INDEX idx_contexts_owner ON contexts (account_id, owner_space)")
     op.execute("CREATE INDEX idx_contexts_status ON contexts (status) WHERE status != 'deleted'")
-    op.execute("""
-    CREATE INDEX idx_contexts_l0_embedding ON contexts
-        USING hnsw (l0_embedding vector_cosine_ops)
-        WITH (m = 16, ef_construction = 64)
-    """)
+    op.execute(dialect.hnsw_index_sql(
+        "idx_contexts_l0_embedding", "contexts", "l0_embedding",
+    ))
 
     # --- dependencies ---
     op.execute("""
@@ -79,9 +92,9 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_deps_dependent ON dependencies (dependent_id)")
 
     # --- change_events (no RLS) ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE change_events (
-        event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        event_id        UUID PRIMARY KEY DEFAULT {uuid_default},
         timestamp       TIMESTAMPTZ DEFAULT NOW(),
         context_id      UUID NOT NULL REFERENCES contexts(id),
         account_id      TEXT NOT NULL,
@@ -111,14 +124,7 @@ def upgrade() -> None:
     op.execute("CREATE INDEX idx_events_context ON change_events (context_id)")
 
     # --- change_events trigger ---
-    op.execute("""
-    CREATE OR REPLACE FUNCTION notify_change_event() RETURNS trigger AS $$
-    BEGIN
-        PERFORM pg_notify('context_changed', NEW.context_id::text);
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql
-    """)
+    op.execute(dialect.notify_trigger_function_sql())
     op.execute("""
     CREATE TRIGGER trg_change_events_notify
     AFTER INSERT ON change_events
@@ -126,9 +132,9 @@ def upgrade() -> None:
     """)
 
     # --- teams ---
-    op.execute("""
+    op.execute(f"""
     CREATE TABLE teams (
-        id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id          UUID PRIMARY KEY DEFAULT {uuid_default},
         path        TEXT NOT NULL,
         parent_id   UUID REFERENCES teams(id),
         display_name TEXT,
